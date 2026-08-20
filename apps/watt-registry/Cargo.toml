@@ -1,0 +1,10 @@
+[package]
+name = "watt-registry"
+version.workspace = true
+edition.workspace = true
+license = "AGPL-3.0-only"
+
+[dependencies]
+anyhow.workspace = true
+registry-server.workspace = true
+tokio.workspace = true

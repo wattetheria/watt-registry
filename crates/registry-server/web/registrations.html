@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Watt Registry | Registrations</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --ink: #111827;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --green: #16a34a;
+      --green-dark: #166534;
+      --red: #dc2626;
+      --blue: #2563eb;
+      --amber: #b45309;
+      --shadow: 0 1px 2px rgb(15 23 42 / 6%), 0 8px 24px rgb(15 23 42 / 5%);
+      --sidebar: 17rem;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .app-shell { min-height: 100vh; display: grid; grid-template-columns: var(--sidebar) minmax(0, 1fr); }
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: 2rem;
+      padding: 1.5rem 1rem;
+      background: var(--surface);
+      border-right: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: .75rem; padding: .25rem .75rem; }
+    .brand-mark {
+      width: 2rem;
+      height: 2rem;
+      display: grid;
+      place-items: center;
+      color: #fff;
+      background: var(--green);
+      font-weight: 800;
+    }
+    .brand strong { display: block; letter-spacing: .01em; }
+    .brand small { color: var(--muted); font-size: 11px; }
+    .side-heading { margin: 0 .75rem .45rem; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .side-link {
+      display: flex;
+      align-items: center;
+      gap: .65rem;
+      min-height: 2.4rem;
+      padding: .55rem .75rem;
+      color: var(--muted);
+      text-decoration: none;
+      border-left: 2px solid transparent;
+    }
+    .side-link:hover { color: var(--ink); background: var(--surface-soft); }
+    .side-link.active { color: var(--green-dark); background: #f0fdf4; border-left-color: var(--green); font-weight: 700; }
+    .side-icon { width: 1rem; text-align: center; color: currentColor; font-weight: 700; }
+    .sidebar-footer { margin-top: auto; padding: .75rem; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); }
+    .workspace { min-width: 0; padding: 2rem clamp(1rem, 3vw, 3rem); }
+    .workspace-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; }
+    .eyebrow { margin: 0 0 .35rem; color: var(--green-dark); font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    h1, h2, p { margin-top: 0; }
+    h1 { margin-bottom: .4rem; font-size: clamp(1.55rem, 2.5vw, 2.15rem); line-height: 1.15; letter-spacing: 0; }
+    .lead { max-width: 48rem; margin-bottom: 0; color: var(--muted); }
+    .status-pill { display: inline-flex; align-items: center; gap: .4rem; padding: .4rem .65rem; color: var(--green-dark); background: #f0fdf4; border: 1px solid #bbf7d0; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .status-dot { width: .45rem; height: .45rem; background: var(--green); border-radius: 50%; }
+    .summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+    .summary { min-width: 0; padding: 1rem 1.15rem; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
+    .summary-label { margin-bottom: .35rem; color: var(--muted); font-size: 12px; }
+    .summary-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+    .summary-value code { font-size: 12px; font-weight: 600; }
+    .panel { background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
+    .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 1.15rem; border-bottom: 1px solid var(--line); }
+    .panel-header h2 { margin: 0; font-size: 1rem; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: .55rem; padding: .8rem 1.15rem; background: var(--surface-soft); border-bottom: 1px solid var(--line); }
+    .field, .button { min-height: 2.2rem; border: 1px solid var(--line); background: var(--surface); }
+    .field { min-width: 10rem; padding: .45rem .6rem; color: var(--ink); }
+    .field::placeholder { color: #9ca3af; }
+    .button { padding: .45rem .75rem; color: var(--ink); font-weight: 700; }
+    .button:hover { border-color: #9ca3af; background: var(--surface-soft); }
+    .button-primary { color: #fff; background: var(--green); border-color: var(--green); }
+    .button-primary:hover { color: #fff; background: #15803d; border-color: #15803d; }
+    .button-danger { color: var(--red); border-color: #fecaca; }
+    .button-danger:hover { color: #991b1b; background: #fef2f2; }
+    .button-small { min-height: 1.9rem; padding: .3rem .55rem; font-size: 12px; }
+    .toolbar-spacer { flex: 1; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 900px; }
+    th, td { padding: .8rem 1.15rem; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); background: var(--surface-soft); font-size: 11px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: #fcfdfd; }
+    .identity { display: grid; gap: .2rem; min-width: 12rem; }
+    .identity strong { font-size: 13px; }
+    .identity span, .muted { color: var(--muted); font-size: 12px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; word-break: break-all; }
+    .chip { display: inline-flex; align-items: center; padding: .25rem .5rem; border: 1px solid var(--line); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
+    .chip-pending, .chip-draft { color: var(--amber); background: #fffbeb; border-color: #fde68a; }
+    .chip-approved { color: var(--green-dark); background: #f0fdf4; border-color: #bbf7d0; }
+    .chip-rejected, .chip-disabled { color: #991b1b; background: #fef2f2; border-color: #fecaca; }
+    .actions { display: flex; flex-wrap: wrap; gap: .35rem; min-width: 12rem; }
+    .empty { padding: 3rem 1rem; color: var(--muted); text-align: center; }
+    .error { margin: 1rem 1.15rem; padding: .7rem .8rem; color: #991b1b; background: #fef2f2; border: 1px solid #fecaca; }
+    dialog { width: min(50rem, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); padding: 0; color: var(--ink); background: var(--surface); border: 1px solid var(--line); box-shadow: 0 18px 60px rgb(15 23 42 / 20%); }
+    dialog::backdrop { background: rgb(15 23 42 / 35%); }
+    .dialog-header, .dialog-footer { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 1.15rem; border-bottom: 1px solid var(--line); }
+    .dialog-footer { justify-content: flex-end; border-top: 1px solid var(--line); border-bottom: 0; }
+    .dialog-body { padding: 1.15rem; overflow: auto; }
+    .dialog-body pre { margin: 0; padding: .9rem; overflow: auto; background: var(--surface-soft); border: 1px solid var(--line); font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+    .close { min-height: 2rem; padding: .25rem .55rem; color: var(--muted); background: transparent; border: 1px solid transparent; }
+    .close:hover { color: var(--ink); border-color: var(--line); }
+    @media (max-width: 900px) {
+      :root { --sidebar: 13rem; }
+      .summary-grid { grid-template-columns: 1fr; }
+      .workspace { padding: 1.25rem; }
+    }
+    @media (max-width: 640px) {
+      .app-shell { display: block; }
+      .sidebar { gap: 1rem; padding: 1rem; border-right: 0; border-bottom: 1px solid var(--line); }
+      .sidebar-footer { display: none; }
+      .workspace-header { display: block; }
+      .status-pill { margin-top: 1rem; }
+      .panel-header { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">W</div>
+        <div><strong>Watt Registry</strong><small>Network authority</small></div>
+      </div>
+      <div>
+        <p class="side-heading">Workspace</p>
+        <a class="side-link active" href="/admin/registrations"><span class="side-icon" aria-hidden="true">+</span><span>Registrations</span></a>
+      </div>
+      <div class="sidebar-footer">Initial server mode has no administrator login. Protect this endpoint at the network or reverse-proxy boundary.</div>
+    </aside>
+    <main class="workspace">
+      <header class="workspace-header">
+        <div>
+          <p class="eyebrow">Approval console</p>
+          <h1>Network registrations</h1>
+          <p class="lead">Review Agent registration requests, issue signed membership credentials, and disable or restore existing memberships.</p>
+        </div>
+        <div class="status-pill"><span class="status-dot" aria-hidden="true"></span><span id="server-status">Checking server</span></div>
+      </header>
+
+      <section class="summary-grid" aria-label="Registry summary">
+        <div class="summary"><div class="summary-label">Authority public ID</div><div class="summary-value"><code id="authority-id">Loading</code></div></div>
+        <div class="summary"><div class="summary-label">Registration mode</div><div class="summary-value" id="registration-mode">Loading</div></div>
+        <div class="summary"><div class="summary-label">Visible requests</div><div class="summary-value" id="registration-count">0</div></div>
+      </section>
+
+      <section class="panel" aria-labelledby="registrations-heading">
+        <div class="panel-header">
+          <div><h2 id="registrations-heading">Review queue</h2><span class="muted">Signed decisions are issued by this registry authority.</span></div>
+          <label class="muted">Reviewer <input class="field" id="reviewer-id" value="operator" maxlength="128" aria-label="Reviewer ID"></label>
+        </div>
+        <div class="toolbar">
+          <select class="field" id="status-filter" aria-label="Filter by status">
+            <option value="">All statuses</option>
+            <option value="draft">Draft</option>
+            <option value="pending">Pending</option>
+            <option value="approved">Approved</option>
+            <option value="rejected">Rejected</option>
+            <option value="disabled">Disabled</option>
+          </select>
+          <input class="field" id="network-filter" placeholder="Filter network ID" aria-label="Filter by network ID">
+          <span class="toolbar-spacer"></span>
+          <button class="button" id="refresh" type="button">Refresh</button>
+        </div>
+        <div id="error" class="error" hidden role="alert"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Agent</th><th>Network</th><th>Status</th><th>Submitted / reviewed</th><th>Actions</th></tr></thead>
+            <tbody id="registrations"><tr><td class="empty" colspan="5">Loading registrations...</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="details-dialog" aria-labelledby="details-title">
+    <div class="dialog-header"><h2 id="details-title">Registration details</h2><button class="close" id="close-details" type="button">Close</button></div>
+    <div class="dialog-body"><pre id="details-json"></pre></div>
+  </dialog>
+
+  <script>
+    const statusFilter = document.querySelector('#status-filter');
+    const networkFilter = document.querySelector('#network-filter');
+    const reviewerId = document.querySelector('#reviewer-id');
+    const tableBody = document.querySelector('#registrations');
+    const errorBox = document.querySelector('#error');
+    const detailsDialog = document.querySelector('#details-dialog');
+    let records = [];
+
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+    const shortId = (value) => value && value.length > 24 ? `${value.slice(0, 12)}...${value.slice(-8)}` : value;
+    const formatTime = (value) => value ? new Date(Number(value)).toLocaleString() : 'Not reviewed';
+    const setError = (message = '') => { errorBox.hidden = !message; errorBox.textContent = message; };
+    const chip = (status) => `<span class="chip chip-${escapeHtml(status)}">${escapeHtml(status)}</span>`;
+
+    function actionButtons(record) {
+      const id = escapeHtml(record.request.request_id);
+      const buttons = [`<button class="button button-small" data-view="${id}" type="button">View</button>`];
+      if (record.status === 'draft' || record.status === 'pending') {
+        buttons.push(`<button class="button button-small button-primary" data-action="approve" data-id="${id}" type="button">Approve</button>`);
+        buttons.push(`<button class="button button-small button-danger" data-action="reject" data-id="${id}" type="button">Reject</button>`);
+      } else if (record.status === 'approved') {
+        buttons.push(`<button class="button button-small button-danger" data-action="disable" data-id="${id}" type="button">Disable</button>`);
+      } else if (record.status === 'disabled') {
+        buttons.push(`<button class="button button-small button-primary" data-action="restore" data-id="${id}" type="button">Restore</button>`);
+      }
+      return `<div class="actions">${buttons.join('')}</div>`;
+    }
+
+    function render() {
+      document.querySelector('#registration-count').textContent = String(records.length);
+      if (!records.length) {
+        tableBody.innerHTML = '<tr><td class="empty" colspan="5">No registrations match this filter.</td></tr>';
+        return;
+      }
+      tableBody.innerHTML = records.map((record) => {
+        const request = record.request;
+        const reviewer = record.reviewer_id ? `${escapeHtml(record.reviewer_id)} · ${formatTime(record.reviewed_at_ms)}` : 'Not reviewed';
+        return `<tr>
+          <td><div class="identity"><strong>${escapeHtml(request.nickname)}</strong><span>DID <code title="${escapeHtml(request.agent_did)}">${escapeHtml(shortId(request.agent_did))}</code></span><span>Nonce <code>${escapeHtml(shortId(request.nonce))}</code></span></div></td>
+          <td><div class="identity"><strong>${escapeHtml(request.network_id)}</strong><span>Request <code>${escapeHtml(shortId(request.request_id))}</code></span></div></td>
+          <td>${chip(record.status)}${record.review_note ? `<div class="muted" title="${escapeHtml(record.review_note)}">${escapeHtml(shortId(record.review_note))}</div>` : ''}</td>
+          <td><div class="identity"><span>${formatTime(record.submitted_at_ms)}</span><span>${escapeHtml(reviewer)}</span></div></td>
+          <td>${actionButtons(record)}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function loadAuthority() {
+      const response = await fetch('/v1/authority');
+      if (!response.ok) throw new Error(`Authority request failed (${response.status})`);
+      const body = await response.json();
+      document.querySelector('#authority-id').textContent = body.authority_id || 'Unavailable';
+      document.querySelector('#registration-mode').textContent = body.registration_mode || 'Configured on server';
+      document.querySelector('#server-status').textContent = 'Authority online';
+    }
+
+    async function loadRecords() {
+      const params = new URLSearchParams({ limit: '500' });
+      if (statusFilter.value) params.set('status', statusFilter.value);
+      if (networkFilter.value.trim()) params.set('network_id', networkFilter.value.trim());
+      const response = await fetch(`/v1/registrations?${params}`);
+      if (!response.ok) throw new Error(`Registration request failed (${response.status})`);
+      const body = await response.json();
+      records = Array.isArray(body.records) ? body.records : [];
+      render();
+    }
+
+    async function reload() {
+      setError();
+      try { await Promise.all([loadAuthority(), loadRecords()]); }
+      catch (error) { setError(error.message); document.querySelector('#server-status').textContent = 'Server unavailable'; }
+    }
+
+    async function review(requestId, action) {
+      let note = '';
+      if (action === 'reject' || action === 'disable') {
+        note = window.prompt(`Add a note for ${action} (required):`, '') || '';
+        if (!note.trim()) return;
+      } else if (action === 'approve' || action === 'restore') {
+        note = window.prompt(`Optional note for ${action}:`, '') || '';
+      }
+      setError();
+      try {
+        const response = await fetch(`/v1/registrations/${encodeURIComponent(requestId)}/review`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action, reviewer_id: reviewerId.value.trim() || 'operator', review_note: note.trim() || null })
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || `Review failed (${response.status})`);
+        await loadRecords();
+      } catch (error) { setError(error.message); }
+    }
+
+    tableBody.addEventListener('click', (event) => {
+      const button = event.target.closest('button');
+      if (!button) return;
+      const record = records.find((item) => item.request.request_id === (button.dataset.id || button.dataset.view));
+      if (!record) return;
+      if (button.dataset.action) review(record.request.request_id, button.dataset.action);
+      if (button.dataset.view) {
+        document.querySelector('#details-json').textContent = JSON.stringify(record, null, 2);
+        detailsDialog.showModal();
+      }
+    });
+    document.querySelector('#close-details').addEventListener('click', () => detailsDialog.close());
+    document.querySelector('#refresh').addEventListener('click', reload);
+    statusFilter.addEventListener('change', loadRecords);
+    networkFilter.addEventListener('input', () => { clearTimeout(networkFilter._timer); networkFilter._timer = setTimeout(loadRecords, 250); });
+    reload();
+  </script>
+</body>
+</html>

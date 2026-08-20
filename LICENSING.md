@@ -1,0 +1,29 @@
+Watt Registry Licensing
+=======================
+
+This repository is a mixed-license workspace. Each Rust package is licensed
+under the SPDX license expression declared in that package's Cargo.toml.
+
+Current package license groups:
+
+Apache-2.0:
+
+- crates/registry-protocol
+
+AGPL-3.0-only:
+
+- crates/registry-crypto
+- crates/registry-storage
+- crates/registry-server
+- apps/watt-registry
+
+Full license texts are provided in:
+
+- LICENSE-APACHE for Apache-2.0
+- LICENSE-AGPL for AGPL-3.0-only
+
+If a file is not clearly part of one package, treat the closest package
+manifest or explicit file header as authoritative.
+
+Commercial licensing is available separately for use cases that require terms
+different from AGPL-3.0-only. Contact the project maintainers for details.

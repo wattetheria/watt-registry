@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: watt_registry
+      POSTGRES_USER: watt_registry
+      POSTGRES_PASSWORD: ${WATT_REGISTRY_POSTGRES_PASSWORD:?set WATT_REGISTRY_POSTGRES_PASSWORD in .env}
+    volumes:
+      - watt_registry_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watt_registry -d watt_registry"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  registry:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      WATT_REGISTRY_HTTP_ADDR: 0.0.0.0:8042
+      WATT_REGISTRY_DATABASE_URL: postgres://watt_registry:${WATT_REGISTRY_POSTGRES_PASSWORD}@postgres:5432/watt_registry
+      WATT_REGISTRY_AUTHORITY_SEED_FILE: /var/lib/watt-registry/data/authority.seed.hex
+      WATT_REGISTRY_REGISTRATION_MODE: ${WATT_REGISTRY_REGISTRATION_MODE:-manual}
+      WATT_REGISTRY_CREDENTIAL_TTL_SECONDS: ${WATT_REGISTRY_CREDENTIAL_TTL_SECONDS:-0}
+    ports:
+      - "${WATT_REGISTRY_PORT:-8042}:8042"
+    volumes:
+      - watt_registry_data:/var/lib/watt-registry/data
+
+volumes:
+  watt_registry_postgres:
+  watt_registry_data:

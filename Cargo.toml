@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/registry-protocol",
+    "crates/registry-crypto",
+    "crates/registry-storage",
+    "crates/registry-server",
+    "apps/watt-registry",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = "0.8"
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hex = "0.4"
+rand = "0.8"
+postgres = "0.19"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_jcs = "0.2"
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "net"] }
+tower = "0.5"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+watt-did = { git = "https://github.com/wattetheria/watt-did.git" }
+
+registry-protocol = { path = "crates/registry-protocol" }
+registry-crypto = { path = "crates/registry-crypto" }
+registry-storage = { path = "crates/registry-storage" }
+registry-server = { path = "crates/registry-server" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
