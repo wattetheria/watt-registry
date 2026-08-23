@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Watt Registry | Authority</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --ink: #111827;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --green: #16a34a;
+      --green-dark: #166534;
+      --red: #dc2626;
+      --shadow: 0 1px 2px rgb(15 23 42 / 6%), 0 8px 24px rgb(15 23 42 / 5%);
+      --sidebar: 17rem;
+    }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body { margin: 0; color: var(--ink); background: var(--bg); font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button, input, select { font: inherit; }
+    button { cursor: pointer; }
+    .app-shell { min-height: 100vh; display: grid; grid-template-columns: var(--sidebar) minmax(0, 1fr); }
+    .sidebar { display: flex; flex-direction: column; gap: 2rem; padding: 1.5rem 1rem; background: var(--surface); border-right: 1px solid var(--line); }
+    .brand { display: flex; align-items: center; gap: .75rem; padding: .25rem .75rem; }
+    .brand-mark { width: 2rem; height: 2rem; display: grid; place-items: center; color: #fff; background: var(--green); font-weight: 800; }
+    .brand strong { display: block; letter-spacing: .01em; }
+    .brand small { color: var(--muted); font-size: 11px; }
+    .side-heading { margin: 0 .75rem .45rem; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .side-link { display: flex; align-items: center; gap: .65rem; min-height: 2.4rem; padding: .55rem .75rem; color: var(--muted); text-decoration: none; border-left: 2px solid transparent; }
+    .side-link:hover { color: var(--ink); background: var(--surface-soft); }
+    .side-link.active { color: var(--green-dark); background: #f0fdf4; border-left-color: var(--green); font-weight: 700; }
+    .side-icon { width: 1rem; text-align: center; color: currentColor; font-weight: 700; }
+    .sidebar-footer { margin-top: auto; padding: .75rem; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); }
+    .workspace { min-width: 0; padding: 2rem clamp(1rem, 3vw, 3rem); }
+    .workspace-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; }
+    .eyebrow { margin: 0 0 .35rem; color: var(--green-dark); font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    h1, h2, p { margin-top: 0; }
+    h1 { margin-bottom: .4rem; font-size: clamp(1.55rem, 2.5vw, 2.15rem); line-height: 1.15; letter-spacing: 0; }
+    .lead { max-width: 48rem; margin-bottom: 0; color: var(--muted); }
+    .status-pill { display: inline-flex; align-items: center; gap: .4rem; padding: .4rem .65rem; color: var(--green-dark); background: #f0fdf4; border: 1px solid #bbf7d0; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .status-dot { width: .45rem; height: .45rem; background: var(--green); border-radius: 50%; }
+    .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+    .summary { min-width: 0; padding: 1rem 1.15rem; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
+    .summary-label { margin-bottom: .35rem; color: var(--muted); font-size: 12px; }
+    .summary-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+    .summary-value code { font-size: 12px; font-weight: 600; }
+    .panel { background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
+    .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 1.15rem; border-bottom: 1px solid var(--line); }
+    .panel-header h2 { margin: 0; font-size: 1rem; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .authority-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; padding: 1rem 1.15rem; }
+    .form-field { display: grid; gap: .35rem; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .field { width: 100%; min-height: 2.2rem; min-width: 0; padding: .45rem .6rem; color: var(--ink); background: var(--surface); border: 1px solid var(--line); font-weight: 400; }
+    .authority-actions { grid-column: 1 / -1; display: flex; align-items: center; flex-wrap: wrap; gap: .75rem; padding-top: .25rem; }
+    .button { min-height: 2.2rem; padding: .45rem .75rem; color: var(--ink); background: var(--surface); border: 1px solid var(--line); font-weight: 700; }
+    .button:hover { border-color: #9ca3af; background: var(--surface-soft); }
+    .button-primary { color: #fff; background: var(--green); border-color: var(--green); }
+    .button-primary:hover { color: #fff; background: #15803d; border-color: #15803d; }
+    .button:disabled { cursor: wait; opacity: .6; }
+    .authority-result { color: var(--muted); font-size: 12px; }
+    .authority-result.success { color: var(--green-dark); }
+    .authority-result.failure { color: #991b1b; }
+    .error { margin: 1rem 1.15rem; padding: .7rem .8rem; color: #991b1b; background: #fef2f2; border: 1px solid #fecaca; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; word-break: break-all; }
+    @media (max-width: 900px) {
+      :root { --sidebar: 13rem; }
+      .summary-grid, .authority-form { grid-template-columns: 1fr; }
+      .workspace { padding: 1.25rem; }
+    }
+    @media (max-width: 640px) {
+      .app-shell { display: block; }
+      .sidebar { gap: 1rem; padding: 1rem; border-right: 0; border-bottom: 1px solid var(--line); }
+      .sidebar-footer { display: none; }
+      .workspace-header { display: block; }
+      .status-pill { margin-top: 1rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">W</div>
+        <div><strong>Watt Registry</strong><small>Network authority</small></div>
+      </div>
+      <div>
+        <p class="side-heading">Workspace</p>
+        <a class="side-link" href="/admin/registrations"><span class="side-icon" aria-hidden="true">+</span><span>Registrations</span></a>
+        <a class="side-link active" href="/admin/authority"><span class="side-icon" aria-hidden="true">◆</span><span>Authority</span></a>
+      </div>
+      <div class="sidebar-footer">Initial server mode has no administrator login. Protect this endpoint at the network or reverse-proxy boundary.</div>
+    </aside>
+    <main class="workspace">
+      <header class="workspace-header">
+        <div>
+          <p class="eyebrow">Network authority</p>
+          <h1>Authority setup</h1>
+          <p class="lead">Initialize or rotate the signing key used for network membership credentials.</p>
+        </div>
+        <div class="status-pill"><span class="status-dot" aria-hidden="true"></span><span id="server-status">Checking server</span></div>
+      </header>
+
+      <section class="summary-grid" aria-label="Authority summary">
+        <div class="summary"><div class="summary-label">Authority ID</div><div class="summary-value"><code id="authority-id">Loading</code></div></div>
+        <div class="summary"><div class="summary-label">Genesis node ID</div><div class="summary-value"><code id="genesis-node-id">Loading</code></div></div>
+        <div class="summary"><div class="summary-label">Active signing key</div><div class="summary-value"><code id="signing-key-id">Loading</code></div></div>
+        <div class="summary"><div class="summary-label">Signature algorithm</div><div class="summary-value" id="signing-algorithm">Loading</div></div>
+      </section>
+
+      <section class="panel" aria-labelledby="authority-setup-heading">
+        <div class="panel-header">
+          <div><h2 id="authority-setup-heading">Initialize signing key</h2><span class="muted">The seed is validated against the Genesis public ID before it is stored.</span></div>
+        </div>
+        <div class="authority-form">
+          <label class="form-field">Network ID<input class="field" id="authority-network-id" value="mainnet:watt-etheria" maxlength="256" autocomplete="off"></label>
+          <label class="form-field">Genesis node ID<input class="field" id="authority-genesis-id" maxlength="128" autocomplete="off" spellcheck="false"></label>
+          <label class="form-field">Signature algorithm<select class="field" id="authority-algorithm"><option value="ed25519">Ed25519</option></select></label>
+          <label class="form-field">Seed file<input class="field" id="authority-seed-file" type="file" accept=".hex,.txt,text/plain"></label>
+          <label class="form-field">Seed hex<input class="field" id="authority-seed-hex" type="password" maxlength="128" autocomplete="new-password" spellcheck="false" placeholder="64 hexadecimal characters"></label>
+          <div class="authority-actions">
+            <button class="button button-primary" id="initialize-authority" type="button">Initialize / rotate key</button>
+            <span class="authority-result" id="authority-setup-result" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+      </section>
+      <div id="error" class="error" hidden role="alert"></div>
+    </main>
+  </div>
+
+  <script>
+    const authorityNetworkId = document.querySelector('#authority-network-id');
+    const authorityGenesisId = document.querySelector('#authority-genesis-id');
+    const authorityAlgorithm = document.querySelector('#authority-algorithm');
+    const authoritySeedFile = document.querySelector('#authority-seed-file');
+    const authoritySeedHex = document.querySelector('#authority-seed-hex');
+    const initializeAuthorityButton = document.querySelector('#initialize-authority');
+    const authoritySetupResult = document.querySelector('#authority-setup-result');
+    const errorBox = document.querySelector('#error');
+
+    const shortId = (value) => value && value.length > 24 ? `${value.slice(0, 12)}...${value.slice(-8)}` : value;
+    const setError = (message = '') => { errorBox.hidden = !message; errorBox.textContent = message; };
+    const setAuthoritySetupResult = (message = '', kind = '') => {
+      authoritySetupResult.textContent = message;
+      authoritySetupResult.className = `authority-result${kind ? ` ${kind}` : ''}`;
+    };
+
+    async function loadAuthority() {
+      const networkId = authorityNetworkId.value.trim();
+      if (!networkId) throw new Error('Network ID is required');
+      const response = await fetch(`/v1/authority/status?network_id=${encodeURIComponent(networkId)}`);
+      if (!response.ok) throw new Error(`Authority request failed (${response.status})`);
+      const body = await response.json();
+      if (!body.initialized) {
+        document.querySelector('#authority-id').textContent = 'Not initialized';
+        document.querySelector('#genesis-node-id').textContent = 'Not initialized';
+        document.querySelector('#signing-key-id').textContent = 'Not initialized';
+        document.querySelector('#signing-algorithm').textContent = 'Not initialized';
+        document.querySelector('#server-status').textContent = 'Authority setup required';
+        authorityGenesisId.value = '';
+        setAuthoritySetupResult('No authority is initialized for this network.', 'failure');
+        return;
+      }
+      document.querySelector('#authority-id').textContent = body.authority_id || 'Unavailable';
+      document.querySelector('#genesis-node-id').textContent = body.genesis_node_id || 'Unavailable';
+      document.querySelector('#signing-key-id').textContent = body.signing_key_id || 'Unavailable';
+      document.querySelector('#signing-algorithm').textContent = body.signing_algorithm || 'Unavailable';
+      authorityGenesisId.value = body.genesis_node_id || '';
+      authorityAlgorithm.value = body.signing_algorithm || 'ed25519';
+      if (body.valid === false) {
+        document.querySelector('#server-status').textContent = 'Authority setup required';
+        setAuthoritySetupResult(body.error || 'Signing key does not match the authority.', 'failure');
+      } else {
+        document.querySelector('#server-status').textContent = 'Authority online';
+      }
+    }
+
+    async function initializeAuthority() {
+      const networkId = authorityNetworkId.value.trim();
+      const genesisNodeId = authorityGenesisId.value.trim();
+      let seedHex = authoritySeedHex.value.trim();
+      if (authoritySeedFile.files[0]) seedHex = (await authoritySeedFile.files[0].text()).trim();
+      if (!networkId || !genesisNodeId || !seedHex) {
+        setAuthoritySetupResult('Network ID, Genesis node ID and seed are required.', 'failure');
+        return;
+      }
+      if (!window.confirm('Rotate this network authority? Existing credentials will be revoked and Agents must register again.')) return;
+      setError();
+      setAuthoritySetupResult('Writing signing key');
+      initializeAuthorityButton.disabled = true;
+      try {
+        const response = await fetch('/v1/authority/initialize', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ network_id: networkId, genesis_node_id: genesisNodeId, signature_algorithm: authorityAlgorithm.value, seed_hex: seedHex }),
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || `Authority initialization failed (${response.status})`);
+        authoritySeedHex.value = '';
+        authoritySeedFile.value = '';
+        setAuthoritySetupResult(`Active key ${shortId(body.signing_key_id)}. ${body.revoked_credentials || 0} old credentials revoked.`, 'success');
+        await loadAuthority();
+      } catch (error) {
+        setAuthoritySetupResult(error.message, 'failure');
+      } finally {
+        initializeAuthorityButton.disabled = false;
+      }
+    }
+
+    initializeAuthorityButton.addEventListener('click', initializeAuthority);
+    authorityNetworkId.addEventListener('change', () => { loadAuthority().catch((error) => setError(error.message)); });
+    loadAuthority().catch((error) => { setError(error.message); document.querySelector('#server-status').textContent = 'Server unavailable'; });
+  </script>
+</body>
+</html>

@@ -2454,6 +2454,9 @@ dependencies = [
  "hex",
  "rand 0.8.7",
  "registry-protocol",
+ "serde_jcs 0.2.0",
+ "serde_json",
+ "sha2 0.10.9",
  "watt-did",
 ]
 
@@ -2474,10 +2477,12 @@ dependencies = [
  "axum",
  "base64",
  "ed25519-dalek",
+ "hex",
  "registry-crypto",
  "registry-protocol",
  "registry-storage",
  "serde",
+ "serde_jcs 0.2.0",
  "serde_json",
  "tokio",
  "tower",
@@ -2495,6 +2500,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]

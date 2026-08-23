@@ -75,7 +75,7 @@
     .lead { max-width: 48rem; margin-bottom: 0; color: var(--muted); }
     .status-pill { display: inline-flex; align-items: center; gap: .4rem; padding: .4rem .65rem; color: var(--green-dark); background: #f0fdf4; border: 1px solid #bbf7d0; font-size: 12px; font-weight: 700; white-space: nowrap; }
     .status-dot { width: .45rem; height: .45rem; background: var(--green); border-radius: 50%; }
-    .summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+    .summary-grid { display: grid; grid-template-columns: minmax(12rem, 20rem); gap: 1rem; margin-bottom: 1.5rem; }
     .summary { min-width: 0; padding: 1rem 1.15rem; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
     .summary-label { margin-bottom: .35rem; color: var(--muted); font-size: 12px; }
     .summary-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
@@ -145,6 +145,7 @@
       <div>
         <p class="side-heading">Workspace</p>
         <a class="side-link active" href="/admin/registrations"><span class="side-icon" aria-hidden="true">+</span><span>Registrations</span></a>
+        <a class="side-link" href="/admin/authority"><span class="side-icon" aria-hidden="true">◆</span><span>Authority</span></a>
       </div>
       <div class="sidebar-footer">Initial server mode has no administrator login. Protect this endpoint at the network or reverse-proxy boundary.</div>
     </aside>
@@ -159,8 +160,6 @@
       </header>
 
       <section class="summary-grid" aria-label="Registry summary">
-        <div class="summary"><div class="summary-label">Authority public ID</div><div class="summary-value"><code id="authority-id">Loading</code></div></div>
-        <div class="summary"><div class="summary-label">Registration mode</div><div class="summary-value" id="registration-mode">Loading</div></div>
         <div class="summary"><div class="summary-label">Visible requests</div><div class="summary-value" id="registration-count">0</div></div>
       </section>
 
@@ -209,7 +208,27 @@
 
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
     const shortId = (value) => value && value.length > 24 ? `${value.slice(0, 12)}...${value.slice(-8)}` : value;
-    const formatTime = (value) => value ? new Date(Number(value)).toLocaleString() : 'Not reviewed';
+    const timestampFields = new Set([
+      'created_at', 'decided_at', 'disabled_at', 'expires_at', 'first_seen_at',
+      'issued_at', 'last_seen_at', 'record_expires_at', 'record_updated_at',
+      'registered_at', 'reviewed_at', 'submitted_at', 'updated_at',
+    ]);
+    const isTimestampField = (key) => key.endsWith('_at_ms') || timestampFields.has(key);
+    const timestampMilliseconds = (value) => {
+      if (typeof value === 'number') return value;
+      const text = String(value).trim();
+      if (/^\d+(?:\.\d+)?$/.test(text)) return Number(text);
+      return Date.parse(text);
+    };
+    const formatTime = (value) => {
+      if (value === null || value === undefined || value === '') return 'Not reviewed';
+      const date = new Date(timestampMilliseconds(value));
+      return Number.isNaN(date.getTime()) ? 'Invalid date' : date.toISOString();
+    };
+    const formatDetails = (record) => JSON.stringify(record, (key, value) => {
+      if (isTimestampField(key) && value !== null && value !== undefined) return formatTime(value);
+      return value;
+    }, 2);
     const setError = (message = '') => { errorBox.hidden = !message; errorBox.textContent = message; };
     const chip = (status) => `<span class="chip chip-${escapeHtml(status)}">${escapeHtml(status)}</span>`;
 
@@ -246,15 +265,6 @@
       }).join('');
     }
 
-    async function loadAuthority() {
-      const response = await fetch('/v1/authority');
-      if (!response.ok) throw new Error(`Authority request failed (${response.status})`);
-      const body = await response.json();
-      document.querySelector('#authority-id').textContent = body.authority_id || 'Unavailable';
-      document.querySelector('#registration-mode').textContent = body.registration_mode || 'Configured on server';
-      document.querySelector('#server-status').textContent = 'Authority online';
-    }
-
     async function loadRecords() {
       const params = new URLSearchParams({ limit: '500' });
       if (statusFilter.value) params.set('status', statusFilter.value);
@@ -268,7 +278,10 @@
 
     async function reload() {
       setError();
-      try { await Promise.all([loadAuthority(), loadRecords()]); }
+      try {
+        await loadRecords();
+        document.querySelector('#server-status').textContent = 'Registry online';
+      }
       catch (error) { setError(error.message); document.querySelector('#server-status').textContent = 'Server unavailable'; }
     }
 
@@ -299,7 +312,7 @@
       if (!record) return;
       if (button.dataset.action) review(record.request.request_id, button.dataset.action);
       if (button.dataset.view) {
-        document.querySelector('#details-json').textContent = JSON.stringify(record, null, 2);
+        document.querySelector('#details-json').textContent = formatDetails(record);
         detailsDialog.showModal();
       }
     });

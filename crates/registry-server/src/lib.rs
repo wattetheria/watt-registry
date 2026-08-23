@@ -6,13 +6,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use registry_crypto::{
     AuthoritySigner, status_allows_credential, verify_agent_registration_request,
+    verify_discovery_node_record,
 };
 use registry_protocol::{
     RegistrationDecisionKind, RegistrationRecord, RegistrationRequest, RegistrationReviewRequest,
-    RegistrationStatus, UnsignedMembershipCredential, UnsignedRegistrationDecision,
-    normalize_nickname,
+    RegistrationStatus, SignedDiscoveryNodeRecord, UnsignedMembershipCredential,
+    UnsignedRegistrationDecision, normalize_nickname,
 };
-use registry_storage::RegistryStore;
+use registry_storage::{
+    NetworkAuthorityConfig, NetworkAuthorityRecord, RegistrationNodeStatus,
+    RegistrationSigningKeyRecord, RegistryStore,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -21,7 +25,6 @@ use uuid::Uuid;
 
 const ENV_HTTP_ADDR: &str = "WATT_REGISTRY_HTTP_ADDR";
 const ENV_DATABASE_URL: &str = "WATT_REGISTRY_DATABASE_URL";
-const ENV_AUTHORITY_SEED_HEX: &str = "WATT_REGISTRY_AUTHORITY_SEED_HEX";
 const ENV_AUTHORITY_SEED_FILE: &str = "WATT_REGISTRY_AUTHORITY_SEED_FILE";
 const ENV_REGISTRATION_MODE: &str = "WATT_REGISTRY_REGISTRATION_MODE";
 const ENV_CREDENTIAL_TTL_SECONDS: &str = "WATT_REGISTRY_CREDENTIAL_TTL_SECONDS";
@@ -66,9 +69,8 @@ impl RegistryConfig {
         let credential_ttl_seconds = parse_ttl_seconds()?;
         Ok(Self {
             http_addr: std::env::var(ENV_HTTP_ADDR).unwrap_or_else(|_| "0.0.0.0:8042".to_owned()),
-            database_url: std::env::var(ENV_DATABASE_URL).unwrap_or_else(|_| {
-                "postgres://postgres:postgres@127.0.0.1:55432/watt_registry".to_owned()
-            }),
+            database_url: std::env::var(ENV_DATABASE_URL)
+                .with_context(|| format!("{ENV_DATABASE_URL} must be set"))?,
             authority_seed_file,
             credential_ttl_seconds,
             registration_mode: RegistrationMode::from_env()?,
@@ -88,7 +90,7 @@ impl std::fmt::Debug for RegistryState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RegistryState")
-            .field("authority_id", &self.authority.authority_id())
+            .field("bootstrap_public_key_hex", &self.authority.public_key_hex())
             .field("credential_ttl_seconds", &self.credential_ttl_seconds)
             .field("registration_mode", &self.registration_mode)
             .finish()
@@ -97,11 +99,9 @@ impl std::fmt::Debug for RegistryState {
 
 impl RegistryState {
     pub fn from_config(config: &RegistryConfig) -> Result<Self> {
-        let authority = if let Ok(seed) = std::env::var(ENV_AUTHORITY_SEED_HEX) {
-            AuthoritySigner::from_seed_hex(&seed)?
-        } else {
-            AuthoritySigner::load_or_create(&config.authority_seed_file)?
-        };
+        // The seed file is a bootstrap input only. Once a network authority
+        // exists, signing is resolved from the PostgreSQL key record.
+        let authority = AuthoritySigner::load_or_create(&config.authority_seed_file)?;
         Ok(Self {
             store: RegistryStore::open(&config.database_url)?,
             authority,
@@ -115,6 +115,8 @@ pub fn build_router(state: RegistryState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/authority", get(authority))
+        .route("/v1/authority/status", get(authority_status))
+        .route("/v1/authority/initialize", post(initialize_authority))
         .route("/v1/registrations/draft", post(create_draft))
         .route("/v1/registrations/manual", post(create_manual))
         .route("/v1/registrations/auto", post(create_auto))
@@ -128,7 +130,12 @@ pub fn build_router(state: RegistryState) -> Router {
             "/v1/registrations/{request_id}/review",
             post(review_registration),
         )
+        .route("/v1/nodes/discovery", post(announce_node))
+        .route("/v1/nodes", get(list_nodes))
+        .route("/v1/nodes/{node_id}", get(get_node))
+        .route("/v1/nodes/{node_id}/agents", get(list_node_agents))
         .route("/admin/registrations", get(admin_page))
+        .route("/admin/authority", get(admin_authority_page))
         // Existing Wattswarm clients can switch their registration base URL
         // without changing their request and response paths first.
         .route("/api/network/registration/auto", post(create_auto_legacy))
@@ -153,12 +160,27 @@ pub async fn serve(config: RegistryConfig, state: RegistryState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.http_addr)
         .await
         .with_context(|| format!("bind registry HTTP address {}", config.http_addr))?;
-    println!(
-        "watt-registry listening on {} authority_id={} mode={:?}",
-        config.http_addr,
-        state.authority.authority_id(),
-        state.registration_mode
-    );
+    println!("watt-registry listening on {}", config.http_addr);
+    let store = state.store.clone();
+    let authorities = tokio::task::spawn_blocking(move || store.list_network_authorities())
+        .await
+        .context("join network authority startup query")??;
+    if authorities.is_empty() {
+        println!("watt-registry network authorities are not initialized");
+    } else {
+        for authority in authorities {
+            println!(
+                "watt-registry authority_id={} network_id={} genesis_node_id={} signing_key_id={} algorithm={} mode={} status={}",
+                authority.authority_id,
+                authority.network_id,
+                authority.genesis_node_id,
+                authority.active_signing_key_id,
+                authority.signature_algorithm,
+                authority.registration_mode,
+                authority.status,
+            );
+        }
+    }
     axum::serve(listener, build_router(state)).await?;
     Ok(())
 }
@@ -177,16 +199,188 @@ struct LegacyRegistrationListQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct NodeListQuery {
+    network_id: Option<String>,
+    status: Option<RegistrationNodeStatus>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct NodeScopeQuery {
+    network_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthorityQuery {
+    network_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthorityInitializationRequest {
+    network_id: String,
+    genesis_node_id: String,
+    signature_algorithm: String,
+    seed_hex: String,
+}
+
+struct ResolvedAuthority {
+    record: NetworkAuthorityRecord,
+    key: RegistrationSigningKeyRecord,
+    signer: AuthoritySigner,
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"ok": true, "service": "watt-registry"}))
 }
 
-async fn authority(State(state): State<RegistryState>) -> Json<serde_json::Value> {
-    Json(json!({
+async fn authority(
+    State(state): State<RegistryState>,
+    Query(query): Query<AuthorityQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if let Some(network_id) = query.network_id.as_deref() {
+        let authority =
+            ensure_network_authority_async(state.clone(), network_id.to_owned()).await?;
+        return Ok(Json(json!({
+            "ok": true,
+            "authority_id": authority.record.authority_id,
+            "network_id": authority.record.network_id,
+            "genesis_node_id": authority.record.genesis_node_id,
+            "signing_key_id": authority.key.key_id,
+            "signing_algorithm": authority.key.algorithm,
+            "registration_mode": authority.record.registration_mode,
+            "status": authority.record.status,
+        })));
+    }
+    Ok(Json(json!({
         "ok": true,
-        "authority_id": state.authority.authority_id(),
         "registration_mode": format_registration_mode(state.registration_mode),
-    }))
+    })))
+}
+
+async fn authority_status(
+    State(state): State<RegistryState>,
+    Query(query): Query<AuthorityQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let network_id = query
+        .network_id
+        .ok_or_else(|| ApiError::bad_request("network_id is required"))?;
+    let status = run_blocking(move || {
+        let Some(record) = state.store.get_network_authority(&network_id)? else {
+            return Ok(json!({
+                "ok": true,
+                "initialized": false,
+                "network_id": network_id,
+            }));
+        };
+        let Some(key) = state.store.get_active_signing_key(&network_id)? else {
+            return Ok(json!({
+                "ok": true,
+                "initialized": true,
+                "valid": false,
+                "authority_id": record.authority_id,
+                "network_id": record.network_id,
+                "genesis_node_id": record.genesis_node_id,
+                "signing_key_id": record.active_signing_key_id,
+                "signing_algorithm": record.signature_algorithm,
+                "registration_mode": record.registration_mode,
+                "status": record.status,
+                "error": "network authority has no active signing key",
+            }));
+        };
+        let valid = key.algorithm == record.signature_algorithm
+            && key.public_key_hex == record.genesis_node_id;
+        Ok(json!({
+            "ok": true,
+            "initialized": true,
+            "valid": valid,
+            "authority_id": record.authority_id,
+            "network_id": record.network_id,
+            "genesis_node_id": record.genesis_node_id,
+            "signing_key_id": key.key_id,
+            "signing_algorithm": key.algorithm,
+            "registration_mode": record.registration_mode,
+            "status": record.status,
+            "error": (!valid)
+                .then_some("network authority signing key does not match its authority"),
+        }))
+    })
+    .await?;
+    Ok(Json(status))
+}
+
+async fn initialize_authority(
+    State(state): State<RegistryState>,
+    Json(request): Json<AuthorityInitializationRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let network_id = validate_authority_input("network_id", &request.network_id, 256)?;
+    let supplied_genesis_id =
+        validate_authority_input("genesis_node_id", &request.genesis_node_id, 128)?;
+    let signature_algorithm =
+        validate_authority_input("signature_algorithm", &request.signature_algorithm, 64)?;
+    let seed_hex = request.seed_hex.trim().to_owned();
+    let signer = AuthoritySigner::from_algorithm_seed_hex(&signature_algorithm, &seed_hex)
+        .map_err(|error| ApiError::bad_request(format!("invalid authority seed: {error}")))?;
+    let genesis_node_id = signer.public_key_hex();
+    if !genesis_node_id.eq_ignore_ascii_case(&supplied_genesis_id) {
+        return Err(ApiError::bad_request(
+            "genesis_node_id does not match the public key derived from seed_hex",
+        ));
+    }
+    let key_id = format!("{signature_algorithm}-{genesis_node_id}");
+    let state_for_task = state.clone();
+    let result = run_blocking(move || {
+        let registration_mode = state_for_task
+            .store
+            .get_network_authority(&network_id)?
+            .map(|authority| authority.registration_mode)
+            .unwrap_or_else(|| {
+                format_registration_mode(state_for_task.registration_mode).to_owned()
+            });
+        Ok(state_for_task
+            .store
+            .initialize_or_rotate_network_authority(
+                &NetworkAuthorityConfig {
+                    network_id,
+                    genesis_node_id,
+                    active_signing_key_id: key_id,
+                    signature_algorithm,
+                    public_key_hex: signer.public_key_hex(),
+                    private_key_hex: seed_hex,
+                    registration_mode,
+                },
+                now_ms(),
+            )?)
+    })
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "initialized": true,
+        "authority_id": result.authority.authority_id,
+        "network_id": result.authority.network_id,
+        "genesis_node_id": result.authority.genesis_node_id,
+        "signing_key_id": result.signing_key.key_id,
+        "signing_algorithm": result.signing_key.algorithm,
+        "registration_mode": result.authority.registration_mode,
+        "status": result.authority.status,
+        "revoked_credentials": result.revoked_credentials,
+        "disabled_agents": result.disabled_agents,
+        "disabled_node_agents": result.disabled_node_agents,
+    })))
+}
+
+fn validate_authority_input(
+    field: &str,
+    value: &str,
+    max_chars: usize,
+) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > max_chars || value.chars().any(char::is_control)
+    {
+        return Err(ApiError::bad_request(format!("{field} is invalid")));
+    }
+    Ok(value.to_owned())
 }
 
 fn format_registration_mode(mode: RegistrationMode) -> &'static str {
@@ -195,6 +389,69 @@ fn format_registration_mode(mode: RegistrationMode) -> &'static str {
         RegistrationMode::Manual => "manual",
         RegistrationMode::Disabled => "disabled",
     }
+}
+
+fn ensure_network_authority(
+    state: &RegistryState,
+    network_id: &str,
+) -> ApiResult<ResolvedAuthority> {
+    if let Some(record) = state.store.get_network_authority(network_id)? {
+        return resolve_active_authority(state, record);
+    }
+
+    let bootstrap_signer = &state.authority;
+    let algorithm = bootstrap_signer.algorithm();
+    let public_key_hex = bootstrap_signer.public_key_hex();
+    let key_id = format!("{algorithm}-{public_key_hex}");
+    let record = state.store.ensure_network_authority(
+        &NetworkAuthorityConfig {
+            network_id: network_id.to_owned(),
+            genesis_node_id: public_key_hex.clone(),
+            active_signing_key_id: key_id,
+            signature_algorithm: algorithm.to_owned(),
+            public_key_hex: public_key_hex.clone(),
+            private_key_hex: bootstrap_signer.seed_hex(),
+            registration_mode: format_registration_mode(state.registration_mode).to_owned(),
+        },
+        now_ms(),
+    )?;
+    resolve_active_authority(state, record)
+}
+
+fn resolve_active_authority(
+    state: &RegistryState,
+    record: NetworkAuthorityRecord,
+) -> ApiResult<ResolvedAuthority> {
+    if record.status != "active" {
+        return Err(ApiError::bad_request("network authority is disabled"));
+    }
+    let key = state
+        .store
+        .get_active_signing_key(&record.network_id)?
+        .ok_or_else(|| ApiError::bad_request("network authority has no active signing key"))?;
+    if key.algorithm != record.signature_algorithm {
+        return Err(ApiError::bad_request(
+            "network authority signing algorithm does not match active key",
+        ));
+    }
+    let signer = AuthoritySigner::from_algorithm_seed_hex(&key.algorithm, &key.private_key_hex)?;
+    if signer.public_key_hex() != key.public_key_hex {
+        return Err(ApiError::bad_request(
+            "network authority signing key does not match its public key",
+        ));
+    }
+    Ok(ResolvedAuthority {
+        record,
+        key,
+        signer,
+    })
+}
+
+async fn ensure_network_authority_async(
+    state: RegistryState,
+    network_id: String,
+) -> ApiResult<ResolvedAuthority> {
+    run_blocking(move || ensure_network_authority(&state, &network_id)).await
 }
 
 async fn run_blocking<T, F>(task: F) -> ApiResult<T>
@@ -211,13 +468,15 @@ async fn create_draft(
     State(state): State<RegistryState>,
     Json(request): Json<RegistrationRequest>,
 ) -> ApiResult<Json<RegistrationRecord>> {
-    if state.registration_mode == RegistrationMode::Disabled {
+    let authority =
+        ensure_network_authority_async(state.clone(), request.network_id.clone()).await?;
+    if authority.record.registration_mode == "disabled" {
         return Err(ApiError::bad_request("registration is disabled by policy"));
     }
     validate_request(&request)?;
     let store = state.store.clone();
     let record = run_blocking(move || {
-        Ok(store.insert_request(&request, RegistrationStatus::Draft, now_ms())?)
+        Ok(store.insert_request(&request, RegistrationStatus::Draft, "manual", now_ms())?)
     })
     .await?;
     Ok(Json(record))
@@ -227,7 +486,9 @@ async fn create_manual(
     State(state): State<RegistryState>,
     Json(request): Json<RegistrationRequest>,
 ) -> ApiResult<Json<RegistrationRecord>> {
-    if state.registration_mode != RegistrationMode::Manual {
+    let authority =
+        ensure_network_authority_async(state.clone(), request.network_id.clone()).await?;
+    if authority.record.registration_mode != "manual" {
         return Err(ApiError::bad_request(
             "manual registration is disabled by policy",
         ));
@@ -235,7 +496,7 @@ async fn create_manual(
     validate_request(&request)?;
     let store = state.store.clone();
     let record = run_blocking(move || {
-        Ok(store.insert_request(&request, RegistrationStatus::Pending, now_ms())?)
+        Ok(store.insert_request(&request, RegistrationStatus::Pending, "manual", now_ms())?)
     })
     .await?;
     Ok(Json(record))
@@ -245,7 +506,9 @@ async fn create_auto(
     State(state): State<RegistryState>,
     Json(request): Json<RegistrationRequest>,
 ) -> ApiResult<Json<RegistrationRecord>> {
-    if state.registration_mode != RegistrationMode::Auto {
+    let authority =
+        ensure_network_authority_async(state.clone(), request.network_id.clone()).await?;
+    if authority.record.registration_mode != "auto" {
         return Err(ApiError::bad_request(
             "automatic registration is disabled by policy",
         ));
@@ -253,10 +516,12 @@ async fn create_auto(
     validate_request(&request)?;
     let state_for_task = state.clone();
     let record = run_blocking(move || {
-        let record =
-            state_for_task
-                .store
-                .insert_request(&request, RegistrationStatus::Pending, now_ms())?;
+        let record = state_for_task.store.insert_request(
+            &request,
+            RegistrationStatus::Pending,
+            "auto",
+            now_ms(),
+        )?;
         let record = match record.status {
             RegistrationStatus::Approved => record,
             RegistrationStatus::Pending => apply_review(
@@ -342,6 +607,64 @@ async fn list_registrations_legacy(
         .into_iter()
         .map(legacy_record_value)
         .collect::<Result<Vec<_>>>()?;
+    Ok(Json(json!({"ok": true, "records": records})))
+}
+
+async fn announce_node(
+    State(state): State<RegistryState>,
+    Json(record): Json<SignedDiscoveryNodeRecord>,
+) -> ApiResult<Json<registry_storage::RegistrationNodeRecord>> {
+    verify_discovery_node_record(&record, now_ms())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let store = state.store.clone();
+    let stored = run_blocking(move || Ok(store.upsert_discovery_node(&record, now_ms())?)).await?;
+    Ok(Json(stored))
+}
+
+async fn list_nodes(
+    State(state): State<RegistryState>,
+    Query(query): Query<NodeListQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = state.store.clone();
+    let network_id = query.network_id;
+    let status = query.status;
+    let limit = query.limit.unwrap_or(100);
+    let records =
+        run_blocking(move || Ok(store.list_nodes(network_id.as_deref(), status, limit)?)).await?;
+    Ok(Json(json!({"ok": true, "records": records})))
+}
+
+async fn get_node(
+    State(state): State<RegistryState>,
+    Path(node_id): Path<String>,
+    Query(query): Query<NodeScopeQuery>,
+) -> ApiResult<Json<registry_storage::RegistrationNodeRecord>> {
+    let network_id = query
+        .network_id
+        .ok_or_else(|| ApiError::bad_request("network_id is required"))?;
+    let store = state.store.clone();
+    let record = run_blocking(move || {
+        store
+            .get_node(&network_id, &node_id)?
+            .ok_or_else(|| ApiError::not_found("node not found"))
+    })
+    .await?;
+    Ok(Json(record))
+}
+
+async fn list_node_agents(
+    State(state): State<RegistryState>,
+    Path(node_id): Path<String>,
+    Query(query): Query<NodeScopeQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let network_id = query
+        .network_id
+        .ok_or_else(|| ApiError::bad_request("network_id is required"))?;
+    let store = state.store.clone();
+    let limit = query.limit.unwrap_or(100);
+    let records =
+        run_blocking(move || Ok(store.list_visible_node_agents(&network_id, &node_id, limit)?))
+            .await?;
     Ok(Json(json!({"ok": true, "records": records})))
 }
 
@@ -475,6 +798,7 @@ fn apply_review(
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .or_else(|| Some("operator".to_owned()));
+    let authority = ensure_network_authority(state, &record.request.network_id)?;
     let unsigned_decision = UnsignedRegistrationDecision {
         version: registry_protocol::REGISTRATION_PROTOCOL_VERSION,
         request_id: record.request.request_id.clone(),
@@ -487,29 +811,38 @@ fn apply_review(
         review_note: review_note
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty()),
-        issuer_authority_id: state.authority.authority_id(),
+        issuer_authority_id: authority.record.authority_id.clone(),
+        signing_key_id: Some(authority.key.key_id.clone()),
+        signature_algorithm: Some(authority.key.algorithm.clone()),
     };
-    let decision = state.authority.sign_decision(unsigned_decision)?;
-    AuthoritySigner::verify_decision(&decision, &state.authority.authority_id())?;
+    let decision = authority.signer.sign_decision(unsigned_decision)?;
+    AuthoritySigner::verify_decision(
+        &decision,
+        &authority.record.authority_id,
+        &authority.key.public_key_hex,
+    )?;
 
     let credential = if status_allows_credential(next_status) {
         let issued_at_ms = reviewed_at_ms;
         let expires_at_ms = credential_expiry(state, issued_at_ms)?;
-        let credential = state
-            .authority
+        let credential = authority
+            .signer
             .sign_credential(UnsignedMembershipCredential {
                 version: registry_protocol::REGISTRATION_PROTOCOL_VERSION,
                 credential_id: Uuid::new_v4().to_string(),
                 request_id: record.request.request_id.clone(),
                 network_id: record.request.network_id.clone(),
                 agent_did: record.request.agent_did.clone(),
-                issuer_authority_id: state.authority.authority_id(),
+                issuer_authority_id: authority.record.authority_id.clone(),
                 issued_at_ms,
                 expires_at_ms,
+                signing_key_id: Some(authority.key.key_id.clone()),
+                signature_algorithm: Some(authority.key.algorithm.clone()),
             })?;
         AuthoritySigner::verify_credential(
             &credential,
-            &state.authority.authority_id(),
+            &authority.record.authority_id,
+            &authority.key.public_key_hex,
             issued_at_ms,
         )?;
         Some(credential)
@@ -692,6 +1025,10 @@ async fn admin_page() -> Html<&'static str> {
     Html(include_str!("../web/registrations.html"))
 }
 
+async fn admin_authority_page() -> Html<&'static str> {
+    Html(include_str!("../web/authority.html"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,21 +1036,31 @@ mod tests {
     use axum::http::Request;
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
-    use registry_protocol::{REGISTRATION_PROTOCOL_VERSION, RegistrationRequest};
+    use registry_protocol::{
+        DISCOVERY_PROTOCOL_VERSION, DiscoveryNodeRecordBody, REGISTRATION_PROTOCOL_VERSION,
+        RegistrationRequest, SignedDiscoveryNodeRecord,
+    };
+    use serde_json::json;
     use tower::ServiceExt;
 
     fn signed_request() -> RegistrationRequest {
+        signed_request_with_id("1")
+    }
+
+    fn signed_request_with_id(id: &str) -> RegistrationRequest {
         let key = SigningKey::from_bytes(&[11; 32]);
         let did = watt_did::DidKey::from_ed25519_public_key(key.verifying_key().to_bytes())
             .expect("Agent DID");
         let mut request = RegistrationRequest {
             version: REGISTRATION_PROTOCOL_VERSION,
-            request_id: "request-1".to_owned(),
+            request_id: format!("request-{id}"),
             network_id: "network-1".to_owned(),
             agent_did: format!("did:key:{}", did.public_key_multibase),
             nickname: "Agent One".to_owned(),
+            agent_card: None,
+            agent_card_hash: None,
             tenant_instance_id: None,
-            nonce: "nonce-1".to_owned(),
+            nonce: format!("nonce-{id}"),
             signature_b64: String::new(),
         };
         request.signature_b64 = base64::engine::general_purpose::STANDARD.encode(
@@ -721,6 +1068,31 @@ mod tests {
                 .to_bytes(),
         );
         request
+    }
+
+    fn signed_discovery_record() -> SignedDiscoveryNodeRecord {
+        let key = SigningKey::from_bytes(&[41; 32]);
+        let node_id = hex::encode(key.verifying_key().to_bytes());
+        let updated_at_ms = now_ms();
+        let body = DiscoveryNodeRecordBody {
+            protocol_version: DISCOVERY_PROTOCOL_VERSION.to_owned(),
+            network_id: "network-1".to_owned(),
+            node_id: node_id.clone(),
+            signing_public_key_hex: node_id,
+            seq: 1,
+            updated_at_ms,
+            ttl_ms: 5_000,
+            geo: None,
+            capabilities: json!({"services": ["wattswarm.node"]}),
+            topic_providers: Vec::new(),
+            transport_contact: None,
+            source_agent_card: None,
+        };
+        let signature = key.sign(&body.signing_bytes().expect("discovery bytes"));
+        SignedDiscoveryNodeRecord {
+            body,
+            signature_hex: hex::encode(signature.to_bytes()),
+        }
     }
 
     #[tokio::test]
@@ -756,11 +1128,188 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_issues_a_verifiable_credential_and_records_review_metadata() {
-        let authority = AuthoritySigner::from_seed([22; 32]);
-        let authority_id = authority.authority_id();
+    async fn automatic_registration_issues_a_new_credential_after_rejection() {
         let state = RegistryState {
             store: RegistryStore::open_in_memory().expect("store"),
+            authority: AuthoritySigner::from_seed([12; 32]),
+            credential_ttl_seconds: None,
+            registration_mode: RegistrationMode::Auto,
+        };
+        let first = signed_request_with_id("old");
+        let pending = state
+            .store
+            .insert_request(&first, RegistrationStatus::Pending, "auto", now_ms())
+            .expect("old pending request");
+        let rejected = apply_review(
+            &state,
+            pending,
+            RegistrationDecisionKind::Reject,
+            Some("automatic".to_owned()),
+            Some("old authority no longer applies".to_owned()),
+        )
+        .expect("reject old request");
+        assert_eq!(rejected.status, RegistrationStatus::Rejected);
+
+        let second = signed_request_with_id("replacement");
+        let response = build_router(state)
+            .oneshot(
+                Request::post("/v1/registrations/auto")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&second).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let record: RegistrationRecord = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("registration record");
+        assert_eq!(record.request.request_id, second.request_id);
+        assert_eq!(record.status, RegistrationStatus::Approved);
+        assert!(record.credential.is_some());
+    }
+
+    #[tokio::test]
+    async fn authority_initialization_endpoint_persists_matching_seed() {
+        let state = RegistryState {
+            store: RegistryStore::open_in_memory().expect("store"),
+            authority: AuthoritySigner::from_seed([12; 32]),
+            credential_ttl_seconds: None,
+            registration_mode: RegistrationMode::Manual,
+        };
+        let app = build_router(state);
+        let signer = AuthoritySigner::from_seed([13; 32]);
+        let request = json!({
+            "network_id": "network-1",
+            "genesis_node_id": signer.public_key_hex(),
+            "signature_algorithm": "ed25519",
+            "seed_hex": signer.seed_hex(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/authority/initialize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::get("/v1/authority/status?network_id=network-1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("status json");
+        Uuid::parse_str(body["authority_id"].as_str().expect("authority ID"))
+            .expect("authority ID is a UUID");
+        assert_eq!(body["genesis_node_id"], signer.public_key_hex());
+        assert_eq!(body["signing_algorithm"], "ed25519");
+    }
+
+    #[tokio::test]
+    async fn authority_setup_is_served_as_a_separate_admin_page() {
+        let state = RegistryState {
+            store: RegistryStore::open_in_memory().expect("store"),
+            authority: AuthoritySigner::from_seed([12; 32]),
+            credential_ttl_seconds: None,
+            registration_mode: RegistrationMode::Manual,
+        };
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/admin/authority")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let authority_page = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
+                .to_vec(),
+        )
+        .expect("html");
+        assert!(authority_page.contains("Authority setup"));
+        assert!(authority_page.contains("/v1/authority/initialize"));
+
+        let response = app
+            .oneshot(
+                Request::get("/admin/registrations")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let registrations_page = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
+                .to_vec(),
+        )
+        .expect("html");
+        assert!(!registrations_page.contains("authority-seed-file"));
+        assert!(registrations_page.contains("/admin/authority"));
+    }
+
+    #[tokio::test]
+    async fn discovery_endpoint_persists_verified_node_records() {
+        let state = RegistryState {
+            store: RegistryStore::open_in_memory().expect("store"),
+            authority: AuthoritySigner::from_seed([12; 32]),
+            credential_ttl_seconds: None,
+            registration_mode: RegistrationMode::Manual,
+        };
+        let app = build_router(state);
+        let record = signed_discovery_record();
+        let node_id = record.body.node_id.clone();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/nodes/discovery")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&record).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/v1/nodes/{node_id}?network_id=network-1"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn approval_issues_a_verifiable_credential_and_records_review_metadata() {
+        let authority = AuthoritySigner::from_seed([22; 32]);
+        let signer_public_key_hex = authority.public_key_hex();
+        let store = RegistryStore::open_in_memory().expect("store");
+        let state = RegistryState {
+            store: store.clone(),
             authority,
             credential_ttl_seconds: Some(60),
             registration_mode: RegistrationMode::Manual,
@@ -807,9 +1356,15 @@ mod tests {
         assert_eq!(body.status, RegistrationStatus::Approved);
         assert_eq!(body.reviewer_id.as_deref(), Some("operator-1"));
         let credential = body.credential.expect("credential");
+        let authority_id = store
+            .get_network_authority(&credential.unsigned.network_id)
+            .expect("authority lookup")
+            .expect("authority")
+            .authority_id;
         AuthoritySigner::verify_credential(
             &credential,
             &authority_id,
+            &signer_public_key_hex,
             credential.unsigned.issued_at_ms,
         )
         .expect("credential verifies");
@@ -845,7 +1400,7 @@ mod tests {
         )
         .expect("json body");
         assert_eq!(body["status"], "active");
-        assert!(body["credential"]["issuer_genesis_id"].is_string());
+        assert!(body["credential"]["issuer_authority_id"].is_string());
         assert!(body["credential"]["issued_at"].is_number());
 
         let response = app

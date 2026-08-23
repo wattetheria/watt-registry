@@ -14,12 +14,20 @@ The registry and the Genesis/Wattswarm node can run on the same server and share
 
 ## Registration flow
 
-1. An Agent signs `RegistrationRequest` with its `did:key` Ed25519 private key. The signature is base64 over the JCS payload domain `wattetheria:network-registration-request:v1`.
+1. An Agent signs `RegistrationRequest` with its `did:key` Ed25519 private key. The signature is base64 over the JCS payload domain `wattetheria:network-registration-request:v1`; `nickname` remains mutable metadata and is not included in that payload.
 2. The server verifies the Agent DID signature, validates the network/nickname uniqueness constraints, and stores the request as `pending` in manual mode.
 3. An operator opens `/admin/registrations`, chooses an action, and submits a review note when rejecting or disabling a registration.
-4. The server signs both the review decision and, for `approved` or restored registrations, a `MembershipCredential` with the configured Genesis/network-authority Ed25519 seed. The authority ID is the hex-encoded 32-byte public key; it is not an Agent DID.
+4. The server signs both the review decision and, for `approved` or restored registrations, a `MembershipCredential` with the configured Genesis/network-authority Ed25519 seed. The issuer is the registry-generated authority UUID; the Genesis node ID and signing public key remain separate cryptographic material.
+5. Wattswarm submits its signed `DiscoveryNodeRecord` to `/v1/nodes/discovery`. The registry verifies the node signature, stores the latest node record, and materializes a node-to-Agent link from `source_agent_card.agent_id`.
 
-The authority key is independent from an Agent DID and is persisted in the configured seed file. In a Genesis deployment, configure that file with the Genesis node's signing seed so the emitted `issuer_genesis_id` is the trusted Genesis public ID. `WATT_REGISTRY_CREDENTIAL_TTL_SECONDS` controls credential lifetime; unset or `0` issues credentials without an expiry.
+The authority key is independent from an Agent DID. A bootstrap seed file is
+used only to initialize the network authority and signing-key rows; after that,
+the active key record in PostgreSQL is the signing source. In a Genesis
+deployment, the bootstrap seed must be the Genesis node's signing seed so the
+stored signing public key matches the trusted Genesis node ID. Credentials use
+`issuer_authority_id` to reference the registry authority record.
+`WATT_REGISTRY_CREDENTIAL_TTL_SECONDS` controls credential lifetime; unset or
+`0` issues credentials without an expiry.
 
 The initial server deliberately has no administrator login. Restrict `/admin/registrations` and the review API at the deployment network or reverse-proxy boundary until authentication is added.
 
@@ -45,7 +53,8 @@ cargo run -p watt-registry
 Defaults:
 
 - HTTP: `0.0.0.0:8042` (`WATT_REGISTRY_HTTP_ADDR`)
-- PostgreSQL: `WATT_REGISTRY_DATABASE_URL` (default `postgres://postgres:postgres@127.0.0.1:55432/watt_registry`)
+- PostgreSQL: `WATT_REGISTRY_DATABASE_URL` (required)
+- PostgreSQL host port: `55432` (`WATT_REGISTRY_POSTGRES_PORT`)
 - Authority seed: `data/authority.seed.hex` (`WATT_REGISTRY_AUTHORITY_SEED_FILE`)
 - Mode: `manual` (`WATT_REGISTRY_REGISTRATION_MODE`)
 
@@ -53,11 +62,27 @@ Useful endpoints:
 
 - `GET /health`
 - `GET /v1/authority`
+- `GET /v1/authority/status?network_id=...`
+- `POST /v1/authority/initialize`
 - `POST /v1/registrations/manual`
 - `POST /v1/registrations/auto`
 - `GET /v1/registrations`
 - `POST /v1/registrations/{request_id}/review`
+- `POST /v1/nodes/discovery`
+- `GET /v1/nodes`
+- `GET /v1/nodes/{node_id}?network_id=...`
+- `GET /v1/nodes/{node_id}/agents?network_id=...`
 - `GET /admin/registrations`
+- `GET /admin/authority`
+
+The `/admin/authority` page contains the Authority key setup form. It accepts
+the Genesis node public ID, the signing algorithm, and a seed file (or seed
+hex), derives the public key on the server, and rejects mismatches. The
+database update is transactional: a new key is inserted into
+`registration_signing_keys`, the authority points to it, older active keys are
+retired, and credentials issued by a changed authority are revoked so Agents
+must register again. The status endpoint is read-only and does not create a
+network authority when the network has not been initialized.
 
 The existing Wattswarm paths are also served as compatibility aliases under `/api/network/registration/*`, `/api/network/registrations/*`, and `/network/registrations` while callers move to the new registry URL.
 
@@ -69,7 +94,8 @@ are persisted in named volumes.
 
 ```bash
 cp .env.example .env
-# Set WATT_REGISTRY_POSTGRES_PASSWORD in .env before starting the service.
+# Set WATT_REGISTRY_POSTGRES_USER, WATT_REGISTRY_POSTGRES_DB,
+# WATT_REGISTRY_POSTGRES_PASSWORD, and WATT_REGISTRY_DATABASE_URL in .env.
 docker compose up --build -d
 curl http://127.0.0.1:8042/health
 docker compose logs -f registry

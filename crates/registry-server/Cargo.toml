@@ -18,5 +18,7 @@ uuid.workspace = true
 [dev-dependencies]
 base64.workspace = true
 ed25519-dalek.workspace = true
+hex.workspace = true
+serde_jcs.workspace = true
 tower.workspace = true
 watt-did.workspace = true

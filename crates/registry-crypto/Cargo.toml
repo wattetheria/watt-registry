@@ -11,4 +11,7 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 rand.workspace = true
 registry-protocol.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+sha2.workspace = true
 watt-did.workspace = true

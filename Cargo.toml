@@ -23,6 +23,7 @@ postgres = "0.19"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_jcs = "0.2"
+sha2 = "0.10"
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "net"] }
 tower = "0.5"
 uuid = { version = "1.11", features = ["v4", "serde"] }

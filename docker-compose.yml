@@ -2,14 +2,17 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    command: ["postgres", "-c", "timezone=UTC"]
     environment:
-      POSTGRES_DB: watt_registry
-      POSTGRES_USER: watt_registry
+      POSTGRES_DB: ${WATT_REGISTRY_POSTGRES_DB:?set WATT_REGISTRY_POSTGRES_DB in .env}
+      POSTGRES_USER: ${WATT_REGISTRY_POSTGRES_USER:?set WATT_REGISTRY_POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${WATT_REGISTRY_POSTGRES_PASSWORD:?set WATT_REGISTRY_POSTGRES_PASSWORD in .env}
+    ports:
+      - "${WATT_REGISTRY_POSTGRES_PORT:-55432}:5432"
     volumes:
       - watt_registry_postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U watt_registry -d watt_registry"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -24,7 +27,7 @@ services:
         condition: service_healthy
     environment:
       WATT_REGISTRY_HTTP_ADDR: 0.0.0.0:8042
-      WATT_REGISTRY_DATABASE_URL: postgres://watt_registry:${WATT_REGISTRY_POSTGRES_PASSWORD}@postgres:5432/watt_registry
+      WATT_REGISTRY_DATABASE_URL: ${WATT_REGISTRY_DATABASE_URL:?set WATT_REGISTRY_DATABASE_URL in .env}
       WATT_REGISTRY_AUTHORITY_SEED_FILE: /var/lib/watt-registry/data/authority.seed.hex
       WATT_REGISTRY_REGISTRATION_MODE: ${WATT_REGISTRY_REGISTRATION_MODE:-manual}
       WATT_REGISTRY_CREDENTIAL_TTL_SECONDS: ${WATT_REGISTRY_CREDENTIAL_TTL_SECONDS:-0}
