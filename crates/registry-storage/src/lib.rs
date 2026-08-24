@@ -698,6 +698,38 @@ impl RegistryStore {
         }
     }
 
+    pub fn update_agent_nickname(
+        &self,
+        network_id: &str,
+        agent_did: &str,
+        nickname: &str,
+        now_ms: u64,
+    ) -> Result<RegistrationAgentRecord> {
+        let nickname_key = normalize_nickname(nickname).map_err(anyhow::Error::msg)?;
+        let mut backend = self
+            .backend
+            .lock()
+            .map_err(|_| anyhow::anyhow!("registry database mutex poisoned"))?;
+        match &mut *backend {
+            Backend::Postgres(client) => update_agent_nickname_postgres(
+                client,
+                network_id,
+                agent_did,
+                nickname,
+                &nickname_key,
+                now_ms,
+            ),
+            Backend::Memory(state) => update_agent_nickname_memory(
+                state,
+                network_id,
+                agent_did,
+                nickname,
+                &nickname_key,
+                now_ms,
+            ),
+        }
+    }
+
     pub fn get_credential(
         &self,
         credential_id: &str,
@@ -2298,6 +2330,80 @@ fn update_agent_status_postgres<C: GenericClient + ?Sized>(
     Ok(())
 }
 
+fn update_agent_nickname_memory(
+    state: &mut MemoryState,
+    network_id: &str,
+    agent_did: &str,
+    nickname: &str,
+    nickname_key: &str,
+    now_ms: u64,
+) -> Result<RegistrationAgentRecord> {
+    let key = (network_id.to_owned(), agent_did.to_owned());
+    let Some(agent) = state.agents.get(&key) else {
+        bail!("registered agent is missing for {network_id}/{agent_did}");
+    };
+    if agent.status != RegistrationAgentStatus::Active {
+        bail!("registered agent is not active for {network_id}/{agent_did}");
+    }
+    if state.agents.values().any(|existing| {
+        existing.network_id == network_id
+            && existing.nickname_key == nickname_key
+            && existing.agent_did != agent_did
+            && matches!(
+                existing.status,
+                RegistrationAgentStatus::Active | RegistrationAgentStatus::Disabled
+            )
+    }) {
+        bail!("agent or nickname already has an active registration");
+    }
+    let agent = state
+        .agents
+        .get_mut(&key)
+        .expect("active agent checked above");
+    agent.nickname = nickname.to_owned();
+    agent.nickname_key = nickname_key.to_owned();
+    agent.updated_at_ms = now_ms;
+    Ok(agent.clone())
+}
+
+fn update_agent_nickname_postgres(
+    client: &mut Client,
+    network_id: &str,
+    agent_did: &str,
+    nickname: &str,
+    nickname_key: &str,
+    now_ms: u64,
+) -> Result<RegistrationAgentRecord> {
+    let updated = match client.execute(
+        "UPDATE registration_agents
+         SET nickname = $3, nickname_key = $4, updated_at_ms = $5
+         WHERE network_id = $1 AND agent_did = $2 AND status = 'active'",
+        &[
+            &network_id,
+            &agent_did,
+            &nickname,
+            &nickname_key,
+            &timestamp_from_ms(now_ms),
+        ],
+    ) {
+        Ok(updated) => updated,
+        Err(error)
+            if error
+                .as_db_error()
+                .and_then(|database_error| database_error.constraint())
+                == Some("registration_agents_nickname_active_unique") =>
+        {
+            bail!("agent or nickname already has an active registration")
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if updated == 0 {
+        bail!("registered agent is missing or inactive for {network_id}/{agent_did}");
+    }
+    load_agent_postgres(client, network_id, agent_did)?
+        .context("updated registration agent is missing")
+}
+
 fn get_agent_postgres(
     client: &mut Client,
     network_id: &str,
@@ -3464,6 +3570,46 @@ mod tests {
         store
             .insert_request(&duplicate, RegistrationStatus::Pending, "manual", 13)
             .expect("rejected nickname can retry");
+    }
+
+    #[test]
+    fn registered_agent_nickname_update_is_atomic_and_unique() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        let first = request("one", "Agent One");
+        let second = request("two", "Agent Two");
+        for (request, credential_id, reviewed_at_ms) in [
+            (&first, "credential-one", 20),
+            (&second, "credential-two", 21),
+        ] {
+            store
+                .insert_request(request, RegistrationStatus::Pending, "auto", 10)
+                .expect("insert request");
+            store
+                .transition(
+                    &request.request_id,
+                    RegistrationDecisionKind::Approve,
+                    &decision(
+                        request,
+                        RegistrationDecisionKind::Approve,
+                        RegistrationStatus::Approved,
+                        reviewed_at_ms,
+                    ),
+                    Some(&credential(request, credential_id)),
+                    reviewed_at_ms,
+                )
+                .expect("approve request");
+        }
+
+        let conflict = store
+            .update_agent_nickname(&first.network_id, &first.agent_did, " @AGENT   TWO ", 30)
+            .expect_err("duplicate nickname must fail");
+        assert!(conflict.to_string().contains("active registration"));
+
+        let updated = store
+            .update_agent_nickname(&first.network_id, &first.agent_did, "Agent Renamed", 31)
+            .expect("unique nickname update");
+        assert_eq!(updated.nickname, "Agent Renamed");
+        assert_eq!(updated.nickname_key, "agent renamed");
     }
 
     #[test]

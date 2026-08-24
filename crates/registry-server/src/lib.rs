@@ -135,6 +135,7 @@ pub fn build_router(state: RegistryState) -> Router {
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/{node_id}", get(get_node))
         .route("/v1/nodes/{node_id}/agents", get(list_node_agents))
+        .route("/v1/agents/nickname", post(update_agent_nickname))
         .route("/admin/registrations", get(admin_page))
         .route("/admin/authority", get(admin_authority_page))
         // Existing Wattswarm clients can switch their registration base URL
@@ -224,6 +225,13 @@ struct AuthorityInitializationRequest {
     genesis_node_id: String,
     signature_algorithm: String,
     seed_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentNicknameUpdateRequest {
+    network_id: String,
+    agent_did: String,
+    nickname: String,
 }
 
 struct ResolvedAuthority {
@@ -672,6 +680,46 @@ async fn list_node_agents(
         run_blocking(move || Ok(store.list_visible_node_agents(&network_id, &node_id, limit)?))
             .await?;
     Ok(Json(json!({"ok": true, "records": records})))
+}
+
+async fn update_agent_nickname(
+    State(state): State<RegistryState>,
+    Json(request): Json<AgentNicknameUpdateRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    validate_nickname_update(&request)?;
+    let store = state.store.clone();
+    let network_id = request.network_id.clone();
+    let agent_did = request.agent_did.clone();
+    let nickname = request.nickname.trim().to_owned();
+    let updated = run_blocking(move || {
+        Ok(store.update_agent_nickname(&network_id, &agent_did, &nickname, now_ms())?)
+    })
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "network_id": updated.network_id,
+        "agent_did": updated.agent_did,
+        "nickname": updated.nickname,
+    })))
+}
+
+fn validate_nickname_update(request: &AgentNicknameUpdateRequest) -> Result<(), ApiError> {
+    for (field, value, max_chars) in [
+        ("network_id", request.network_id.as_str(), 256),
+        ("agent_did", request.agent_did.as_str(), 512),
+        ("nickname", request.nickname.as_str(), 80),
+    ] {
+        if value.trim().is_empty() || value.chars().count() > max_chars {
+            return Err(ApiError::bad_request(format!("{field} is invalid")));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ApiError::bad_request(format!(
+                "{field} contains a control character"
+            )));
+        }
+    }
+    normalize_nickname(&request.nickname).map_err(ApiError::bad_request)?;
+    Ok(())
 }
 
 async fn get_registration(
