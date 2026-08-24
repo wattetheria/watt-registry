@@ -99,8 +99,7 @@ CREATE TABLE IF NOT EXISTS registration_agents (
     request_id TEXT NOT NULL,
     network_id TEXT NOT NULL,
     agent_did TEXT NOT NULL,
-    nickname TEXT NOT NULL,
-    nickname_key TEXT NOT NULL,
+    display_name TEXT NOT NULL,
     tenant_instance_id TEXT,
     registration_mode TEXT NOT NULL CHECK(registration_mode IN ('auto', 'manual')),
     credential_id TEXT NOT NULL,
@@ -137,8 +136,38 @@ BEGIN
     ALTER TABLE registration_agents ALTER COLUMN request_id SET NOT NULL;
 END
 $$;
-CREATE UNIQUE INDEX IF NOT EXISTS registration_agents_nickname_active_unique
-    ON registration_agents(network_id, nickname_key)
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'registration_agents'
+          AND column_name = 'nickname'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'registration_agents'
+          AND column_name = 'display_name'
+    ) THEN
+        ALTER TABLE registration_agents RENAME COLUMN nickname TO display_name;
+    END IF;
+END
+$$;
+ALTER TABLE registration_agents
+    DROP COLUMN IF EXISTS nickname_key;
+DROP INDEX IF EXISTS registration_agents_nickname_active_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS registration_agents_display_name_active_unique
+    ON registration_agents(
+        network_id,
+        lower(
+            regexp_replace(
+                regexp_replace(btrim(display_name), '^@', ''),
+                '[[:space:]]+',
+                ' ',
+                'g'
+            )
+        )
+    )
     WHERE status IN ('active', 'disabled');
 CREATE INDEX IF NOT EXISTS registration_agents_status_index
     ON registration_agents(network_id, status, updated_at_ms DESC);
@@ -373,8 +402,7 @@ pub struct RegistrationAgentRecord {
     pub request_id: String,
     pub network_id: String,
     pub agent_did: String,
-    pub nickname: String,
-    pub nickname_key: String,
+    pub display_name: String,
     pub tenant_instance_id: Option<String>,
     pub registration_mode: String,
     pub credential_id: String,
@@ -711,14 +739,9 @@ impl RegistryStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("registry database mutex poisoned"))?;
         match &mut *backend {
-            Backend::Postgres(client) => update_agent_nickname_postgres(
-                client,
-                network_id,
-                agent_did,
-                nickname,
-                &nickname_key,
-                now_ms,
-            ),
+            Backend::Postgres(client) => {
+                update_agent_nickname_postgres(client, network_id, agent_did, nickname, now_ms)
+            }
             Backend::Memory(state) => update_agent_nickname_memory(
                 state,
                 network_id,
@@ -2051,9 +2074,7 @@ fn transition_memory(
             request_id: record.request.request_id.clone(),
             network_id: record.request.network_id.clone(),
             agent_did: record.request.agent_did.clone(),
-            nickname: record.request.nickname.clone(),
-            nickname_key: normalize_nickname(&record.request.nickname)
-                .map_err(anyhow::Error::msg)?,
+            display_name: record.request.nickname.clone(),
             tenant_instance_id: record.request.tenant_instance_id.clone(),
             registration_mode: record.registration_mode.clone(),
             credential_id: credential.unsigned.credential_id.clone(),
@@ -2248,22 +2269,20 @@ fn upsert_agent_postgres<C: GenericClient + ?Sized>(
     registered_at_ms: u64,
     updated_at_ms: u64,
 ) -> Result<RegistrationAgentRecord> {
-    let nickname_key = normalize_nickname(&request.nickname).map_err(anyhow::Error::msg)?;
     let disabled_at_ms = match status {
         RegistrationAgentStatus::Active => None,
         RegistrationAgentStatus::Disabled => Some(timestamp_from_ms(updated_at_ms)),
     };
     client.execute(
         "INSERT INTO registration_agents(
-             request_id, network_id, agent_did, nickname, nickname_key, tenant_instance_id,
+             request_id, network_id, agent_did, display_name, tenant_instance_id,
              registration_mode, credential_id,
              agent_card_json, agent_card_hash, agent_card_updated_at_ms,
              status, registered_at_ms, updated_at_ms, disabled_at_ms
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          ON CONFLICT (network_id, agent_did) DO UPDATE SET
              request_id = EXCLUDED.request_id,
-             nickname = EXCLUDED.nickname,
-             nickname_key = EXCLUDED.nickname_key,
+             display_name = EXCLUDED.display_name,
              tenant_instance_id = EXCLUDED.tenant_instance_id,
              registration_mode = EXCLUDED.registration_mode,
              credential_id = EXCLUDED.credential_id,
@@ -2281,7 +2300,6 @@ fn upsert_agent_postgres<C: GenericClient + ?Sized>(
             &request.network_id,
             &request.agent_did,
             &request.nickname,
-            &nickname_key,
             &request.tenant_instance_id,
             &registration_mode,
             &credential.unsigned.credential_id,
@@ -2347,7 +2365,7 @@ fn update_agent_nickname_memory(
     }
     if state.agents.values().any(|existing| {
         existing.network_id == network_id
-            && existing.nickname_key == nickname_key
+            && normalize_nickname(&existing.display_name).ok().as_deref() == Some(nickname_key)
             && existing.agent_did != agent_did
             && matches!(
                 existing.status,
@@ -2360,8 +2378,7 @@ fn update_agent_nickname_memory(
         .agents
         .get_mut(&key)
         .expect("active agent checked above");
-    agent.nickname = nickname.to_owned();
-    agent.nickname_key = nickname_key.to_owned();
+    agent.display_name = nickname.to_owned();
     agent.updated_at_ms = now_ms;
     Ok(agent.clone())
 }
@@ -2371,18 +2388,16 @@ fn update_agent_nickname_postgres(
     network_id: &str,
     agent_did: &str,
     nickname: &str,
-    nickname_key: &str,
     now_ms: u64,
 ) -> Result<RegistrationAgentRecord> {
     let updated = match client.execute(
         "UPDATE registration_agents
-         SET nickname = $3, nickname_key = $4, updated_at_ms = $5
+         SET display_name = $3, updated_at_ms = $4
          WHERE network_id = $1 AND agent_did = $2 AND status = 'active'",
         &[
             &network_id,
             &agent_did,
             &nickname,
-            &nickname_key,
             &timestamp_from_ms(now_ms),
         ],
     ) {
@@ -2391,7 +2406,7 @@ fn update_agent_nickname_postgres(
             if error
                 .as_db_error()
                 .and_then(|database_error| database_error.constraint())
-                == Some("registration_agents_nickname_active_unique") =>
+                == Some("registration_agents_display_name_active_unique") =>
         {
             bail!("agent or nickname already has an active registration")
         }
@@ -2411,7 +2426,7 @@ fn get_agent_postgres(
 ) -> Result<Option<RegistrationAgentRecord>> {
     client
         .query_opt(
-            "SELECT network_id, agent_did, nickname, nickname_key,
+            "SELECT network_id, agent_did, display_name,
                     request_id,
                     tenant_instance_id, registration_mode,
                     credential_id, agent_card_json, agent_card_hash, agent_card_updated_at_ms,
@@ -2451,7 +2466,7 @@ fn list_agents_postgres(
     let network_id = network_id.map(str::to_owned);
     let status = status.map(agent_status_string).map(str::to_owned);
     let rows = client.query(
-        "SELECT network_id, agent_did, nickname, nickname_key,
+        "SELECT network_id, agent_did, display_name,
                 request_id,
                 tenant_instance_id, registration_mode,
                 credential_id, agent_card_json, agent_card_hash, agent_card_updated_at_ms,
@@ -2520,7 +2535,7 @@ fn load_agent_postgres<C: GenericClient + ?Sized>(
 ) -> Result<Option<RegistrationAgentRecord>> {
     client
         .query_opt(
-            "SELECT network_id, agent_did, nickname, nickname_key,
+            "SELECT network_id, agent_did, display_name,
                     request_id,
                     tenant_instance_id, registration_mode,
                     credential_id, agent_card_json, agent_card_hash, agent_card_updated_at_ms,
@@ -2536,26 +2551,25 @@ fn load_agent_postgres<C: GenericClient + ?Sized>(
 
 fn row_to_agent(row: &Row) -> Result<RegistrationAgentRecord> {
     let agent_card = row
-        .try_get::<_, Option<String>>(8)?
+        .try_get::<_, Option<String>>(7)?
         .map(|value| serde_json::from_str(&value))
         .transpose()
         .context("decode registered Agent Card")?;
     Ok(RegistrationAgentRecord {
-        request_id: row.try_get(4)?,
+        request_id: row.try_get(3)?,
         network_id: row.try_get(0)?,
         agent_did: row.try_get(1)?,
-        nickname: row.try_get(2)?,
-        nickname_key: row.try_get(3)?,
-        tenant_instance_id: row.try_get(5)?,
-        registration_mode: row.try_get(6)?,
-        credential_id: row.try_get(7)?,
+        display_name: row.try_get(2)?,
+        tenant_instance_id: row.try_get(4)?,
+        registration_mode: row.try_get(5)?,
+        credential_id: row.try_get(6)?,
         agent_card,
-        agent_card_hash: row.try_get(9)?,
-        agent_card_updated_at_ms: row_optional_timestamp_ms(row, 10)?,
-        status: parse_agent_status(row.try_get::<_, String>(11)?.as_str())?,
-        registered_at_ms: row_timestamp_ms(row, 12)?,
-        updated_at_ms: row_timestamp_ms(row, 13)?,
-        disabled_at_ms: row_optional_timestamp_ms(row, 14)?,
+        agent_card_hash: row.try_get(8)?,
+        agent_card_updated_at_ms: row_optional_timestamp_ms(row, 9)?,
+        status: parse_agent_status(row.try_get::<_, String>(10)?.as_str())?,
+        registered_at_ms: row_timestamp_ms(row, 11)?,
+        updated_at_ms: row_timestamp_ms(row, 12)?,
+        disabled_at_ms: row_optional_timestamp_ms(row, 13)?,
     })
 }
 
@@ -3316,7 +3330,9 @@ fn map_insert_error(error: postgres::Error) -> anyhow::Error {
         .unwrap_or_default()
         .to_owned();
     match constraint.as_str() {
-        "registration_agent_active_unique" | "registration_nickname_active_unique" => {
+        "registration_agent_active_unique"
+        | "registration_nickname_active_unique"
+        | "registration_agents_display_name_active_unique" => {
             anyhow::anyhow!("agent or nickname already has an active registration")
         }
         "registration_nonce_unique" => {
@@ -3608,8 +3624,7 @@ mod tests {
         let updated = store
             .update_agent_nickname(&first.network_id, &first.agent_did, "Agent Renamed", 31)
             .expect("unique nickname update");
-        assert_eq!(updated.nickname, "Agent Renamed");
-        assert_eq!(updated.nickname_key, "agent renamed");
+        assert_eq!(updated.display_name, "Agent Renamed");
     }
 
     #[test]

@@ -231,7 +231,7 @@ struct AuthorityInitializationRequest {
 struct AgentNicknameUpdateRequest {
     network_id: String,
     agent_did: String,
-    nickname: String,
+    display_name: String,
 }
 
 struct ResolvedAuthority {
@@ -690,16 +690,16 @@ async fn update_agent_nickname(
     let store = state.store.clone();
     let network_id = request.network_id.clone();
     let agent_did = request.agent_did.clone();
-    let nickname = request.nickname.trim().to_owned();
+    let display_name = request.display_name.trim().to_owned();
     let updated = run_blocking(move || {
-        Ok(store.update_agent_nickname(&network_id, &agent_did, &nickname, now_ms())?)
+        Ok(store.update_agent_nickname(&network_id, &agent_did, &display_name, now_ms())?)
     })
     .await?;
     Ok(Json(json!({
         "ok": true,
         "network_id": updated.network_id,
         "agent_did": updated.agent_did,
-        "nickname": updated.nickname,
+        "display_name": updated.display_name,
     })))
 }
 
@@ -707,7 +707,7 @@ fn validate_nickname_update(request: &AgentNicknameUpdateRequest) -> Result<(), 
     for (field, value, max_chars) in [
         ("network_id", request.network_id.as_str(), 256),
         ("agent_did", request.agent_did.as_str(), 512),
-        ("nickname", request.nickname.as_str(), 80),
+        ("display_name", request.display_name.as_str(), 80),
     ] {
         if value.trim().is_empty() || value.chars().count() > max_chars {
             return Err(ApiError::bad_request(format!("{field} is invalid")));
@@ -718,7 +718,7 @@ fn validate_nickname_update(request: &AgentNicknameUpdateRequest) -> Result<(), 
             )));
         }
     }
-    normalize_nickname(&request.nickname).map_err(ApiError::bad_request)?;
+    normalize_nickname(&request.display_name).map_err(ApiError::bad_request)?;
     Ok(())
 }
 
