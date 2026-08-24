@@ -184,7 +184,6 @@ CREATE TABLE IF NOT EXISTS registration_nodes (
     capabilities_json TEXT NOT NULL,
     topic_providers_json TEXT NOT NULL,
     transport_contact_json TEXT,
-    source_agent_card_json TEXT,
     discovery_record_json TEXT NOT NULL,
     record_signature_hex TEXT NOT NULL,
     first_seen_at_ms TIMESTAMPTZ NOT NULL,
@@ -251,6 +250,61 @@ BEGIN
           );
         ALTER TABLE registration_node_agents DROP COLUMN agent_card_json;
         ALTER TABLE registration_node_agents DROP COLUMN agent_card_hash;
+    END IF;
+END
+$$;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'registration_nodes'
+          AND column_name = 'source_agent_card_json'
+    ) THEN
+        UPDATE registration_agents
+        SET agent_card_json = NULL,
+            agent_card_hash = NULL,
+            agent_card_updated_at_ms = NULL
+        WHERE agent_card_json IS NOT NULL
+           OR agent_card_hash IS NOT NULL
+           OR agent_card_updated_at_ms IS NOT NULL;
+
+        WITH latest_source_agent_cards AS (
+            SELECT DISTINCT ON (
+                       network_id,
+                       discovery_record_json::jsonb #>> '{body,source_agent_card,agent_id}'
+                   )
+                   network_id,
+                   discovery_record_json::jsonb
+                       #>> '{body,source_agent_card,agent_id}' AS agent_did,
+                   (discovery_record_json::jsonb
+                       #> '{body,source_agent_card}')::text AS agent_card_json,
+                   discovery_record_json::jsonb
+                       #>> '{body,source_agent_card,card_hash}' AS agent_card_hash,
+                   record_updated_at_ms
+            FROM registration_nodes
+            WHERE jsonb_typeof(
+                      discovery_record_json::jsonb #> '{body,source_agent_card}'
+                  ) = 'object'
+              AND discovery_record_json::jsonb
+                      #> '{body,source_agent_card,card,metadata,network_membership_credential}'
+                  IS NULL
+            ORDER BY network_id,
+                     discovery_record_json::jsonb
+                         #>> '{body,source_agent_card,agent_id}',
+                     record_updated_at_ms DESC,
+                     node_id ASC
+        )
+        UPDATE registration_agents AS agents
+        SET agent_card_json = cards.agent_card_json,
+            agent_card_hash = cards.agent_card_hash,
+            agent_card_updated_at_ms = cards.record_updated_at_ms
+        FROM latest_source_agent_cards AS cards
+        WHERE agents.network_id = cards.network_id
+          AND agents.agent_did = cards.agent_did;
+
+        ALTER TABLE registration_nodes DROP COLUMN source_agent_card_json;
     END IF;
 END
 $$;
@@ -2078,9 +2132,9 @@ fn transition_memory(
             tenant_instance_id: record.request.tenant_instance_id.clone(),
             registration_mode: record.registration_mode.clone(),
             credential_id: credential.unsigned.credential_id.clone(),
-            agent_card: record.request.agent_card.clone(),
-            agent_card_hash: record.request.agent_card_hash.clone(),
-            agent_card_updated_at_ms: record.request.agent_card.as_ref().map(|_| now_ms),
+            agent_card: None,
+            agent_card_hash: None,
+            agent_card_updated_at_ms: None,
             status: RegistrationAgentStatus::Active,
             registered_at_ms: state
                 .agents
@@ -2303,12 +2357,9 @@ fn upsert_agent_postgres<C: GenericClient + ?Sized>(
             &request.tenant_instance_id,
             &registration_mode,
             &credential.unsigned.credential_id,
-            &optional_json(request.agent_card.as_ref())?,
-            &request.agent_card_hash,
-            &request
-                .agent_card
-                .as_ref()
-                .map(|_| timestamp_from_ms(updated_at_ms)),
+            &None::<String>,
+            &None::<String>,
+            &None::<SystemTime>,
             &agent_status_string(status),
             &timestamp_from_ms(registered_at_ms),
             &timestamp_from_ms(updated_at_ms),
@@ -2634,9 +2685,10 @@ fn sync_discovered_agent_link_memory(
     if let Some(agent) = state
         .agents
         .get_mut(&(record.body.network_id.clone(), details.agent_did.clone()))
+        && let Some(source_agent_card) = details.source_agent_card.as_ref()
     {
-        agent.agent_card = Some(details.card);
-        agent.agent_card_hash = details.card_hash;
+        agent.agent_card = Some(source_agent_card.clone());
+        agent.agent_card_hash = details.card_hash.clone();
         agent.agent_card_updated_at_ms = Some(now_ms);
         agent.updated_at_ms = now_ms;
     }
@@ -2692,19 +2744,18 @@ fn upsert_discovery_node_postgres<C: GenericClient + ?Sized>(
     let capabilities_json = serde_json::to_string(&body.capabilities)?;
     let topic_providers_json = serde_json::to_string(&body.topic_providers)?;
     let transport_contact_json = optional_json(body.transport_contact.as_ref())?;
-    let source_agent_card_json = optional_json(body.source_agent_card.as_ref())?;
     let discovery_record_json = serde_json::to_string(record)?;
     client.execute(
         "INSERT INTO registration_nodes(
              network_id, node_id, signing_public_key_hex, protocol_version,
              record_seq, record_updated_at_ms, ttl_ms, record_expires_at_ms,
              geo_json, capabilities_json, topic_providers_json,
-             transport_contact_json, source_agent_card_json, discovery_record_json,
+             transport_contact_json, discovery_record_json,
              record_signature_hex, first_seen_at_ms, last_seen_at_ms,
              created_at_ms, updated_at_ms, status
          ) VALUES (
              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-             $11, $12, $13, $14, $15, $16, $16, $16, $16, 'active'
+             $11, $12, $13, $14, $15, $15, $15, $15, 'active'
          )
          ON CONFLICT (network_id, node_id) DO UPDATE SET
              signing_public_key_hex = EXCLUDED.signing_public_key_hex,
@@ -2717,7 +2768,6 @@ fn upsert_discovery_node_postgres<C: GenericClient + ?Sized>(
              capabilities_json = EXCLUDED.capabilities_json,
              topic_providers_json = EXCLUDED.topic_providers_json,
              transport_contact_json = EXCLUDED.transport_contact_json,
-             source_agent_card_json = EXCLUDED.source_agent_card_json,
              discovery_record_json = EXCLUDED.discovery_record_json,
              record_signature_hex = EXCLUDED.record_signature_hex,
              last_seen_at_ms = EXCLUDED.last_seen_at_ms,
@@ -2736,7 +2786,6 @@ fn upsert_discovery_node_postgres<C: GenericClient + ?Sized>(
             &capabilities_json,
             &topic_providers_json,
             &transport_contact_json,
-            &source_agent_card_json,
             &discovery_record_json,
             &record.signature_hex,
             &timestamp_from_ms(now_ms),
@@ -2771,22 +2820,24 @@ fn sync_discovered_agent_link_postgres<C: GenericClient + ?Sized>(
         }
         None => "pending",
     };
-    let card_json = serde_json::to_string(&details.card)?;
-    client.execute(
-        "UPDATE registration_agents
-         SET agent_card_json = $3,
-             agent_card_hash = $4,
-             agent_card_updated_at_ms = $5,
-             updated_at_ms = $5
-         WHERE network_id = $1 AND agent_did = $2",
-        &[
-            &record.body.network_id,
-            &details.agent_did,
-            &card_json,
-            &details.card_hash,
-            &timestamp_from_ms(now_ms),
-        ],
-    )?;
+    if let Some(source_agent_card) = details.source_agent_card.as_ref() {
+        let card_json = serde_json::to_string(source_agent_card)?;
+        client.execute(
+            "UPDATE registration_agents
+             SET agent_card_json = $3,
+                 agent_card_hash = $4,
+                 agent_card_updated_at_ms = $5,
+                 updated_at_ms = $5
+             WHERE network_id = $1 AND agent_did = $2",
+            &[
+                &record.body.network_id,
+                &details.agent_did,
+                &card_json,
+                &details.card_hash,
+                &timestamp_from_ms(now_ms),
+            ],
+        )?;
+    }
     client.execute(
         "INSERT INTO registration_node_agents(
              network_id, node_id, agent_did,
@@ -2942,7 +2993,12 @@ fn list_nodes_postgres(
            AND (status <> 'active' OR record_expires_at_ms > CURRENT_TIMESTAMP)
            AND (
                status <> 'active'
-               OR source_agent_card_json IS NULL
+               OR NOT EXISTS (
+                   SELECT 1
+                   FROM registration_node_agents AS links
+                   WHERE links.network_id = registration_nodes.network_id
+                     AND links.node_id = registration_nodes.node_id
+               )
                OR EXISTS (
                    SELECT 1
                    FROM registration_node_agents AS links
@@ -3131,7 +3187,7 @@ fn row_to_node_agent(row: &Row) -> Result<RegistrationNodeAgentRecord> {
 #[derive(Debug)]
 struct SourceAgentDetails {
     agent_did: String,
-    card: Value,
+    source_agent_card: Option<Value>,
     card_hash: Option<String>,
 }
 
@@ -3150,17 +3206,22 @@ fn source_agent_details(record: &SignedDiscoveryNodeRecord) -> Result<Option<Sou
     {
         bail!("source_agent_card node_id must match discovery node_id");
     }
-    let card_value = card
-        .get("card")
-        .cloned()
+    card.get("card")
         .context("source_agent_card.card is required")?;
+    let contains_membership_credential = card
+        .pointer("/card/metadata/network_membership_credential")
+        .is_some();
+    let card_hash = if contains_membership_credential {
+        None
+    } else {
+        card.get("card_hash")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    };
     Ok(Some(SourceAgentDetails {
         agent_did,
-        card_hash: card
-            .get("card_hash")
-            .and_then(|value| value.as_str())
-            .map(str::to_owned),
-        card: card_value,
+        source_agent_card: (!contains_membership_credential).then_some(card),
+        card_hash,
     }))
 }
 
@@ -3780,7 +3841,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_and_manual_registrations_materialize_current_agent_projection() {
+    fn registrations_wait_for_discovery_before_storing_source_agent_card() {
         let store = RegistryStore::open_in_memory().expect("store");
         let mut manual = request("manual", "Manual Agent");
         manual.agent_card = Some(json!({"name": "Manual Agent"}));
@@ -3809,17 +3870,8 @@ mod tests {
             .expect("manual agent projection");
         assert_eq!(manual_agent.status, RegistrationAgentStatus::Active);
         assert_eq!(manual_agent.registration_mode, "manual");
-        assert_eq!(
-            manual_agent
-                .agent_card
-                .as_ref()
-                .and_then(|card| card["name"].as_str()),
-            Some("Manual Agent")
-        );
-        assert_eq!(
-            manual_agent.agent_card_hash.as_deref(),
-            Some("sha256:manual")
-        );
+        assert!(manual_agent.agent_card.is_none());
+        assert!(manual_agent.agent_card_hash.is_none());
         let manual_credential = store
             .get_credential("credential-manual")
             .expect("manual credential lookup")
@@ -3926,19 +3978,17 @@ mod tests {
             .expect("active node-agent links");
         assert_eq!(active[0].relation_status, NodeAgentRelationStatus::Active);
 
+        let refreshed_record = discovery_record(&agent.agent_did, 2);
         store
-            .upsert_discovery_node(&discovery_record(&agent.agent_did, 2), 2_250)
+            .upsert_discovery_node(&refreshed_record, 2_250)
             .expect("refresh registered Agent Card");
         let registered_agent = store
             .get_agent(&agent.network_id, &agent.agent_did)
             .expect("registered agent lookup")
             .expect("registered agent projection");
         assert_eq!(
-            registered_agent
-                .agent_card
-                .as_ref()
-                .and_then(|card| card["name"].as_str()),
-            Some("Test Agent")
+            registered_agent.agent_card,
+            refreshed_record.body.source_agent_card
         );
         assert_eq!(
             registered_agent.agent_card_hash.as_deref(),
@@ -3965,6 +4015,56 @@ mod tests {
         assert_eq!(
             disabled[0].relation_status,
             NodeAgentRelationStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn discovery_does_not_store_legacy_membership_credential_in_agent_card() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        let agent = request("legacy-card", "Legacy Card Agent");
+        store
+            .insert_request(&agent, RegistrationStatus::Pending, "auto", 10)
+            .expect("insert agent request");
+        store
+            .transition(
+                &agent.request_id,
+                RegistrationDecisionKind::Approve,
+                &decision(
+                    &agent,
+                    RegistrationDecisionKind::Approve,
+                    RegistrationStatus::Approved,
+                    20,
+                ),
+                Some(&credential(&agent, "credential-legacy-card")),
+                20,
+            )
+            .expect("approve agent");
+
+        let mut record = discovery_record(&agent.agent_did, 1);
+        record.body.source_agent_card.as_mut().expect("Agent Card")["card"] = json!({
+            "name": "Legacy Card Agent",
+            "metadata": {
+                "network_membership_credential": {
+                    "credential_id": "legacy"
+                }
+            }
+        });
+        store
+            .upsert_discovery_node(&record, 30)
+            .expect("store legacy discovery record");
+
+        let registered_agent = store
+            .get_agent(&agent.network_id, &agent.agent_did)
+            .expect("registered agent lookup")
+            .expect("registered agent");
+        assert!(registered_agent.agent_card.is_none());
+        assert!(registered_agent.agent_card_hash.is_none());
+        assert_eq!(
+            store
+                .list_node_agents("network-1", "node-a", 10)
+                .expect("node-agent links")[0]
+                .relation_status,
+            NodeAgentRelationStatus::Active
         );
     }
 }
