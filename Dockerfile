@@ -7,6 +7,16 @@ RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
+# Registry uses the shared signature implementation from Watt Credential.
+# The repositories are cloned as siblings so their normal local path
+# dependencies resolve exactly as they do in a Watt development checkout.
+ARG WATT_CRED_REV=main
+ARG WATT_DID_REV=main
+RUN git clone https://github.com/wattetheria/watt-did.git /watt-did \
+    && git -C /watt-did checkout "${WATT_DID_REV}" \
+    && git clone https://github.com/wattetheria/watt-credential.git /watt-credential \
+    && git -C /watt-credential checkout "${WATT_CRED_REV}"
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY apps ./apps

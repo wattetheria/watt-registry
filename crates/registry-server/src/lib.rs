@@ -9,9 +9,10 @@ use registry_crypto::{
     verify_discovery_node_record,
 };
 use registry_protocol::{
-    RegistrationDecisionKind, RegistrationRecord, RegistrationRequest, RegistrationReviewRequest,
-    RegistrationStatus, SignedDiscoveryNodeRecord, UnsignedMembershipCredential,
-    UnsignedRegistrationDecision, normalize_nickname,
+    BINARY_ENCODING_HEX, RegistrationDecisionKind, RegistrationRecord, RegistrationRequest,
+    RegistrationReviewRequest, RegistrationStatus, SignedDiscoveryNodeRecord,
+    UnsignedAuthorityKeyCertificate, UnsignedMembershipCredential, UnsignedRegistrationDecision,
+    normalize_nickname,
 };
 use registry_storage::{
     NetworkAuthorityConfig, NetworkAuthorityRecord, RegistrationNodeStatus,
@@ -440,6 +441,11 @@ fn resolve_active_authority(
             "network authority signing key does not match its public key",
         ));
     }
+    if key.public_key_hex != record.genesis_node_id {
+        return Err(ApiError::bad_request(
+            "network authority signing key does not match the Genesis trust anchor",
+        ));
+    }
     Ok(ResolvedAuthority {
         record,
         key,
@@ -825,12 +831,26 @@ fn apply_review(
     let credential = if status_allows_credential(next_status) {
         let issued_at_ms = reviewed_at_ms;
         let expires_at_ms = credential_expiry(state, issued_at_ms)?;
+        let issuer_key_certificate =
+            authority
+                .signer
+                .sign_authority_key_certificate(UnsignedAuthorityKeyCertificate {
+                    version: registry_protocol::REGISTRATION_PROTOCOL_VERSION,
+                    network_id: record.request.network_id.clone(),
+                    authority_id: authority.record.authority_id.clone(),
+                    key_id: authority.key.key_id.clone(),
+                    signature_algorithm: authority.key.algorithm.clone(),
+                    public_key_encoding: BINARY_ENCODING_HEX.to_owned(),
+                    public_key: authority.key.public_key_hex.clone(),
+                    trust_anchor_id: authority.record.genesis_node_id.clone(),
+                    issued_at_ms: authority.key.created_at_ms,
+                    expires_at_ms: None,
+                })?;
         let credential = authority
             .signer
             .sign_credential(UnsignedMembershipCredential {
                 version: registry_protocol::REGISTRATION_PROTOCOL_VERSION,
                 credential_id: Uuid::new_v4().to_string(),
-                request_id: record.request.request_id.clone(),
                 network_id: record.request.network_id.clone(),
                 agent_did: record.request.agent_did.clone(),
                 issuer_authority_id: authority.record.authority_id.clone(),
@@ -838,11 +858,13 @@ fn apply_review(
                 expires_at_ms,
                 signing_key_id: Some(authority.key.key_id.clone()),
                 signature_algorithm: Some(authority.key.algorithm.clone()),
+                issuer_key_certificate: Some(issuer_key_certificate),
             })?;
         AuthoritySigner::verify_credential(
             &credential,
             &authority.record.authority_id,
-            &authority.key.public_key_hex,
+            &authority.record.genesis_node_id,
+            &authority.record.genesis_node_id,
             issued_at_ms,
         )?;
         Some(credential)
@@ -1035,22 +1057,55 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use base64::Engine as _;
-    use ed25519_dalek::{Signer, SigningKey};
     use registry_protocol::{
         DISCOVERY_PROTOCOL_VERSION, DiscoveryNodeRecordBody, REGISTRATION_PROTOCOL_VERSION,
         RegistrationRequest, SignedDiscoveryNodeRecord,
     };
     use serde_json::json;
     use tower::ServiceExt;
+    use watt_credential::{SigningKeyMaterial, derive_public_key, sign_detached};
+
+    fn private_key_hex(seed: u8) -> String {
+        hex::encode([seed; 32])
+    }
+
+    fn public_key_hex(seed: u8) -> String {
+        let private_key = private_key_hex(seed);
+        derive_public_key(
+            SigningKeyMaterial {
+                algorithm: registry_protocol::SIGNATURE_ALGORITHM_ED25519,
+                private_key_encoding: registry_protocol::BINARY_ENCODING_HEX,
+                private_key: &private_key,
+            },
+            registry_protocol::BINARY_ENCODING_HEX,
+        )
+        .expect("derive test public key")
+    }
+
+    fn sign_hex(seed: u8, message: &[u8]) -> String {
+        let private_key = private_key_hex(seed);
+        sign_detached(
+            SigningKeyMaterial {
+                algorithm: registry_protocol::SIGNATURE_ALGORITHM_ED25519,
+                private_key_encoding: registry_protocol::BINARY_ENCODING_HEX,
+                private_key: &private_key,
+            },
+            registry_protocol::BINARY_ENCODING_HEX,
+            message,
+        )
+        .expect("sign test payload")
+    }
 
     fn signed_request() -> RegistrationRequest {
         signed_request_with_id("1")
     }
 
     fn signed_request_with_id(id: &str) -> RegistrationRequest {
-        let key = SigningKey::from_bytes(&[11; 32]);
-        let did = watt_did::DidKey::from_ed25519_public_key(key.verifying_key().to_bytes())
-            .expect("Agent DID");
+        let public_key: [u8; 32] = hex::decode(public_key_hex(11))
+            .expect("decode test public key")
+            .try_into()
+            .expect("test public key length");
+        let did = watt_did::DidKey::from_ed25519_public_key(public_key).expect("Agent DID");
         let mut request = RegistrationRequest {
             version: REGISTRATION_PROTOCOL_VERSION,
             request_id: format!("request-{id}"),
@@ -1064,15 +1119,14 @@ mod tests {
             signature_b64: String::new(),
         };
         request.signature_b64 = base64::engine::general_purpose::STANDARD.encode(
-            key.sign(&request.signing_message().expect("bytes"))
-                .to_bytes(),
+            hex::decode(sign_hex(11, &request.signing_message().expect("bytes")))
+                .expect("decode test signature"),
         );
         request
     }
 
     fn signed_discovery_record() -> SignedDiscoveryNodeRecord {
-        let key = SigningKey::from_bytes(&[41; 32]);
-        let node_id = hex::encode(key.verifying_key().to_bytes());
+        let node_id = public_key_hex(41);
         let updated_at_ms = now_ms();
         let body = DiscoveryNodeRecordBody {
             protocol_version: DISCOVERY_PROTOCOL_VERSION.to_owned(),
@@ -1088,10 +1142,9 @@ mod tests {
             transport_contact: None,
             source_agent_card: None,
         };
-        let signature = key.sign(&body.signing_bytes().expect("discovery bytes"));
         SignedDiscoveryNodeRecord {
+            signature_hex: sign_hex(41, &body.signing_bytes().expect("discovery bytes")),
             body,
-            signature_hex: hex::encode(signature.to_bytes()),
         }
     }
 
@@ -1364,6 +1417,7 @@ mod tests {
         AuthoritySigner::verify_credential(
             &credential,
             &authority_id,
+            &signer_public_key_hex,
             &signer_public_key_hex,
             credential.unsigned.issued_at_ms,
         )

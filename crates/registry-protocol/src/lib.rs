@@ -6,7 +6,10 @@ pub const DISCOVERY_PROTOCOL_VERSION: &str = "wattswarm-discovery/1";
 pub const REGISTRATION_REQUEST_DOMAIN: &str = "wattetheria:network-registration-request:v1";
 pub const REGISTRATION_DECISION_DOMAIN: &str = "wattetheria:network-registration-decision:v1";
 pub const MEMBERSHIP_CREDENTIAL_DOMAIN: &str = "wattetheria:network-membership-credential:v1";
+pub const AUTHORITY_KEY_CERTIFICATE_DOMAIN: &str =
+    "wattetheria:registry-authority-key-certificate:v1";
 pub const SIGNATURE_ALGORITHM_ED25519: &str = "ed25519";
+pub const BINARY_ENCODING_HEX: &str = "hex";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,10 +146,63 @@ impl RegistrationDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsignedAuthorityKeyCertificate {
+    pub version: u32,
+    pub network_id: String,
+    pub authority_id: String,
+    pub key_id: String,
+    pub signature_algorithm: String,
+    pub public_key_encoding: String,
+    pub public_key: String,
+    pub trust_anchor_id: String,
+    #[serde(rename = "issued_at", alias = "issued_at_ms")]
+    pub issued_at_ms: u64,
+    #[serde(
+        rename = "expires_at",
+        alias = "expires_at_ms",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityKeyCertificate {
+    #[serde(flatten)]
+    pub unsigned: UnsignedAuthorityKeyCertificate,
+    pub trust_anchor_signature_algorithm: String,
+    pub trust_anchor_signature_encoding: String,
+    pub trust_anchor_signature: String,
+}
+
+impl UnsignedAuthorityKeyCertificate {
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_jcs::to_vec(&serde_json::json!({
+            "domain": AUTHORITY_KEY_CERTIFICATE_DOMAIN,
+            "version": self.version,
+            "network_id": self.network_id,
+            "authority_id": self.authority_id,
+            "key_id": self.key_id,
+            "signature_algorithm": self.signature_algorithm,
+            "public_key_encoding": self.public_key_encoding,
+            "public_key": self.public_key,
+            "trust_anchor_id": self.trust_anchor_id,
+            "issued_at": self.issued_at_ms,
+            "expires_at": self.expires_at_ms,
+        }))
+    }
+}
+
+impl AuthorityKeyCertificate {
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        self.unsigned.signing_bytes()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsignedMembershipCredential {
     pub version: u32,
     pub credential_id: String,
-    pub request_id: String,
     pub network_id: String,
     pub agent_did: String,
     #[serde(alias = "issuer_genesis_id")]
@@ -164,6 +220,8 @@ pub struct UnsignedMembershipCredential {
     pub signing_key_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature_algorithm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_key_certificate: Option<AuthorityKeyCertificate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,7 +237,6 @@ impl UnsignedMembershipCredential {
             "domain": MEMBERSHIP_CREDENTIAL_DOMAIN,
             "version": self.version,
             "credential_id": self.credential_id,
-            "request_id": self.request_id,
             "network_id": self.network_id,
             "agent_did": self.agent_did,
             "issuer_authority_id": self.issuer_authority_id,
@@ -187,6 +244,7 @@ impl UnsignedMembershipCredential {
             "expires_at": self.expires_at_ms,
             "signing_key_id": self.signing_key_id,
             "signature_algorithm": self.signature_algorithm,
+            "issuer_key_certificate": self.issuer_key_certificate,
         }))
     }
 }
@@ -365,5 +423,51 @@ mod tests {
     #[test]
     fn nickname_normalization_is_case_and_whitespace_insensitive() {
         assert_eq!(normalize_nickname(" @Agent   One ").unwrap(), "agent one");
+    }
+
+    #[test]
+    fn membership_credential_payload_has_no_registration_request_id() {
+        let credential = MembershipCredential {
+            unsigned: UnsignedMembershipCredential {
+                version: REGISTRATION_PROTOCOL_VERSION,
+                credential_id: "credential-1".to_owned(),
+                network_id: "network-1".to_owned(),
+                agent_did: "did:key:z6Mkw".to_owned(),
+                issuer_authority_id: "authority-1".to_owned(),
+                issued_at_ms: 100,
+                expires_at_ms: None,
+                signing_key_id: Some("key-1".to_owned()),
+                signature_algorithm: Some(SIGNATURE_ALGORITHM_ED25519.to_owned()),
+                issuer_key_certificate: Some(AuthorityKeyCertificate {
+                    unsigned: UnsignedAuthorityKeyCertificate {
+                        version: REGISTRATION_PROTOCOL_VERSION,
+                        network_id: "network-1".to_owned(),
+                        authority_id: "authority-1".to_owned(),
+                        key_id: "key-1".to_owned(),
+                        signature_algorithm: SIGNATURE_ALGORITHM_ED25519.to_owned(),
+                        public_key_encoding: BINARY_ENCODING_HEX.to_owned(),
+                        public_key: "public-key".to_owned(),
+                        trust_anchor_id: "genesis-1".to_owned(),
+                        issued_at_ms: 90,
+                        expires_at_ms: None,
+                    },
+                    trust_anchor_signature_algorithm: SIGNATURE_ALGORITHM_ED25519.to_owned(),
+                    trust_anchor_signature_encoding: BINARY_ENCODING_HEX.to_owned(),
+                    trust_anchor_signature: "certificate-signature".to_owned(),
+                }),
+            },
+            signature_hex: "signature".to_owned(),
+        };
+        let encoded = serde_json::to_value(&credential).expect("serialize credential");
+        assert!(encoded.get("request_id").is_none());
+        assert!(
+            String::from_utf8(
+                credential
+                    .signing_bytes()
+                    .expect("credential signing bytes")
+            )
+            .expect("utf8 signing bytes")
+            .contains("network-1")
+        );
     }
 }

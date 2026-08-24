@@ -7,7 +7,7 @@ The registry and the Genesis/Wattswarm node can run on the same server and share
 ## Workspace layout
 
 - `crates/registry-protocol`: versioned request, review decision, credential, and status types.
-- `crates/registry-crypto`: Agent DID request verification and authority Ed25519 signing.
+- `crates/registry-crypto`: Registry key custody and signing policy, delegating all signature-suite operations to `watt-credential`.
 - `crates/registry-storage`: PostgreSQL schema and idempotent state transitions.
 - `crates/registry-server`: Axum HTTP API and supervision-style approval page.
 - `apps/watt-registry`: production binary.
@@ -17,7 +17,7 @@ The registry and the Genesis/Wattswarm node can run on the same server and share
 1. An Agent signs `RegistrationRequest` with its `did:key` Ed25519 private key. The signature is base64 over the JCS payload domain `wattetheria:network-registration-request:v1`; `nickname` remains mutable metadata and is not included in that payload.
 2. The server verifies the Agent DID signature, validates the network/nickname uniqueness constraints, and stores the request as `pending` in manual mode.
 3. An operator opens `/admin/registrations`, chooses an action, and submits a review note when rejecting or disabling a registration.
-4. The server signs both the review decision and, for `approved` or restored registrations, a `MembershipCredential` with the configured Genesis/network-authority Ed25519 seed. The issuer is the registry-generated authority UUID; the Genesis node ID and signing public key remain separate cryptographic material.
+4. The server signs both the review decision and, for `approved` or restored registrations, a `MembershipCredential` with the configured Genesis/network-authority key. The Credential embeds an authority-key certificate signed by the Genesis trust anchor, allowing the Agent to detect tampering offline before P2P startup. The Credential subject contains the network and Agent identity, but not the registration `request_id` or mutable nickname.
 5. Wattswarm submits its signed `DiscoveryNodeRecord` to `/v1/nodes/discovery`. The registry verifies the node signature, stores the latest node record, and materializes a node-to-Agent link from `source_agent_card.agent_id`.
 
 The authority key is independent from an Agent DID. A bootstrap seed file is
@@ -26,6 +26,13 @@ the active key record in PostgreSQL is the signing source. In a Genesis
 deployment, the bootstrap seed must be the Genesis node's signing seed so the
 stored signing public key matches the trusted Genesis node ID. Credentials use
 `issuer_authority_id` to reference the registry authority record.
+The certificate records the signing algorithm and key encoding explicitly so
+verification can dispatch through a shared algorithm boundary instead of
+binding consumers to Ed25519-specific code. Existing Credentials without this
+issuer proof are revoked during schema initialization and must be reissued.
+Key generation, public-key derivation, detached signing, and detached
+verification all come from `watt-credential`; Registry code does not implement
+an independent Ed25519 backend.
 `WATT_REGISTRY_CREDENTIAL_TTL_SECONDS` controls credential lifetime; unset or
 `0` issues credentials without an expiry.
 

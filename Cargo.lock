@@ -346,6 +346,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -2450,14 +2451,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
- "ed25519-dalek",
  "hex",
- "rand 0.8.7",
  "registry-protocol",
  "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.10.9",
- "watt-did",
+ "watt-credential",
+ "watt-did 0.1.0 (git+https://github.com/wattetheria/watt-did.git)",
 ]
 
 [[package]]
@@ -2476,7 +2476,6 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
- "ed25519-dalek",
  "hex",
  "registry-crypto",
  "registry-protocol",
@@ -2487,7 +2486,8 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
- "watt-did",
+ "watt-credential",
+ "watt-did 0.1.0 (git+https://github.com/wattetheria/watt-did.git)",
 ]
 
 [[package]]
@@ -3751,6 +3751,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "watt-credential"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "watt-did 0.1.0",
+]
+
+[[package]]
+name = "watt-did"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bs58 0.5.1",
+ "did-method-key",
+ "did-web",
+ "ed25519-dalek",
+ "percent-encoding",
+ "pollster",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "ssi-dids-core",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

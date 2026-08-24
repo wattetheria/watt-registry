@@ -225,6 +225,44 @@ BEGIN
     END IF;
 END
 $$;
+UPDATE registration_credentials
+SET status = 'revoked',
+    revoked_at_ms = COALESCE(revoked_at_ms, CURRENT_TIMESTAMP),
+    updated_at_ms = CURRENT_TIMESTAMP
+WHERE status = 'active'
+  AND NOT (credential_json::jsonb ? 'issuer_key_certificate');
+UPDATE registration_requests AS requests
+SET status = 'rejected',
+    review_note = 'Credential predates offline issuer proof; re-registration is required',
+    updated_at_ms = CURRENT_TIMESTAMP
+WHERE status IN ('approved', 'disabled')
+  AND EXISTS (
+      SELECT 1
+      FROM registration_credentials AS credentials
+      WHERE credentials.request_id = requests.request_id
+        AND NOT (credentials.credential_json::jsonb ? 'issuer_key_certificate')
+  );
+UPDATE registration_agents AS agents
+SET status = 'disabled',
+    disabled_at_ms = COALESCE(disabled_at_ms, CURRENT_TIMESTAMP),
+    updated_at_ms = CURRENT_TIMESTAMP
+WHERE EXISTS (
+    SELECT 1
+    FROM registration_credentials AS credentials
+    WHERE credentials.credential_id = agents.credential_id
+      AND NOT (credentials.credential_json::jsonb ? 'issuer_key_certificate')
+);
+UPDATE registration_node_agents AS relations
+SET relation_status = 'disabled',
+    disabled_at_ms = COALESCE(disabled_at_ms, CURRENT_TIMESTAMP),
+    updated_at_ms = CURRENT_TIMESTAMP
+WHERE EXISTS (
+    SELECT 1
+    FROM registration_agents AS agents
+    WHERE agents.network_id = relations.network_id
+      AND agents.agent_did = relations.agent_did
+      AND agents.status = 'disabled'
+);
 "#;
 
 const REGISTRATION_MODE_AUTO: &str = "auto";
@@ -3050,8 +3088,7 @@ fn validate_transition(
         bail!("approved registration requires a membership credential");
     }
     if credential.is_some_and(|credential| {
-        credential.unsigned.request_id != request_id
-            || credential.unsigned.network_id != current.request.network_id
+        credential.unsigned.network_id != current.request.network_id
             || credential.unsigned.agent_did != current.request.agent_did
     }) {
         bail!("membership credential does not match the stored request");
@@ -3229,9 +3266,11 @@ fn is_active(status: RegistrationStatus) -> bool {
 mod tests {
     use super::*;
     use registry_protocol::{
-        DISCOVERY_PROTOCOL_VERSION, DiscoveryNodeRecordBody, MembershipCredential,
-        REGISTRATION_PROTOCOL_VERSION, RegistrationDecisionKind, RegistrationRequest,
-        SignedDiscoveryNodeRecord, UnsignedMembershipCredential, UnsignedRegistrationDecision,
+        AuthorityKeyCertificate, BINARY_ENCODING_HEX, DISCOVERY_PROTOCOL_VERSION,
+        DiscoveryNodeRecordBody, MembershipCredential, REGISTRATION_PROTOCOL_VERSION,
+        RegistrationDecisionKind, RegistrationRequest, SIGNATURE_ALGORITHM_ED25519,
+        SignedDiscoveryNodeRecord, UnsignedAuthorityKeyCertificate, UnsignedMembershipCredential,
+        UnsignedRegistrationDecision,
     };
     use serde_json::json;
 
@@ -3280,7 +3319,6 @@ mod tests {
             unsigned: UnsignedMembershipCredential {
                 version: REGISTRATION_PROTOCOL_VERSION,
                 credential_id: credential_id.to_owned(),
-                request_id: request.request_id.clone(),
                 network_id: request.network_id.clone(),
                 agent_did: request.agent_did.clone(),
                 issuer_authority_id: "authority".to_owned(),
@@ -3288,6 +3326,23 @@ mod tests {
                 expires_at_ms: None,
                 signing_key_id: None,
                 signature_algorithm: None,
+                issuer_key_certificate: Some(AuthorityKeyCertificate {
+                    unsigned: UnsignedAuthorityKeyCertificate {
+                        version: REGISTRATION_PROTOCOL_VERSION,
+                        network_id: request.network_id.clone(),
+                        authority_id: "authority".to_owned(),
+                        key_id: "key".to_owned(),
+                        signature_algorithm: SIGNATURE_ALGORITHM_ED25519.to_owned(),
+                        public_key_encoding: BINARY_ENCODING_HEX.to_owned(),
+                        public_key: "public-key".to_owned(),
+                        trust_anchor_id: "genesis".to_owned(),
+                        issued_at_ms: 10,
+                        expires_at_ms: None,
+                    },
+                    trust_anchor_signature_algorithm: SIGNATURE_ALGORITHM_ED25519.to_owned(),
+                    trust_anchor_signature_encoding: BINARY_ENCODING_HEX.to_owned(),
+                    trust_anchor_signature: "certificate-signature".to_owned(),
+                }),
             },
             signature_hex: "signature".to_owned(),
         }
