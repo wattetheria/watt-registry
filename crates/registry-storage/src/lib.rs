@@ -12,6 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const REGISTRATION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS registration_schema_migrations (
+    migration_id TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL
+);
 CREATE TABLE IF NOT EXISTS registration_requests (
     request_id TEXT PRIMARY KEY,
     network_id TEXT NOT NULL,
@@ -106,7 +110,7 @@ CREATE TABLE IF NOT EXISTS registration_agents (
     agent_card_json TEXT,
     agent_card_hash TEXT,
     agent_card_updated_at_ms TIMESTAMPTZ,
-    status TEXT NOT NULL CHECK(status IN ('active', 'disabled')),
+    status TEXT NOT NULL CHECK(status IN ('active', 'disabled', 'revoked')),
     registered_at_ms TIMESTAMPTZ NOT NULL,
     updated_at_ms TIMESTAMPTZ NOT NULL,
     disabled_at_ms TIMESTAMPTZ,
@@ -121,6 +125,11 @@ ALTER TABLE registration_agents
     ADD COLUMN IF NOT EXISTS agent_card_hash TEXT;
 ALTER TABLE registration_agents
     ADD COLUMN IF NOT EXISTS agent_card_updated_at_ms TIMESTAMPTZ;
+ALTER TABLE registration_agents
+    DROP CONSTRAINT IF EXISTS registration_agents_status_check;
+ALTER TABLE registration_agents
+    ADD CONSTRAINT registration_agents_status_check
+    CHECK(status IN ('active', 'disabled', 'revoked'));
 UPDATE registration_agents AS agents
 SET request_id = requests.request_id
 FROM registration_requests AS requests
@@ -156,7 +165,8 @@ $$;
 ALTER TABLE registration_agents
     DROP COLUMN IF EXISTS nickname_key;
 DROP INDEX IF EXISTS registration_agents_nickname_active_unique;
-CREATE UNIQUE INDEX IF NOT EXISTS registration_agents_display_name_active_unique
+DROP INDEX IF EXISTS registration_agents_display_name_active_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS registration_agents_display_name_reserved_unique
     ON registration_agents(
         network_id,
         lower(
@@ -168,7 +178,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS registration_agents_display_name_active_unique
             )
         )
     )
-    WHERE status IN ('active', 'disabled');
+    WHERE status IN ('active', 'disabled', 'revoked');
 CREATE INDEX IF NOT EXISTS registration_agents_status_index
     ON registration_agents(network_id, status, updated_at_ms DESC);
 CREATE TABLE IF NOT EXISTS registration_nodes (
@@ -191,10 +201,25 @@ CREATE TABLE IF NOT EXISTS registration_nodes (
     created_at_ms TIMESTAMPTZ NOT NULL,
     updated_at_ms TIMESTAMPTZ NOT NULL,
     status TEXT NOT NULL DEFAULT 'active'
-        CHECK(status IN ('active', 'revoked')),
+        CHECK(status IN ('active', 'stale', 'disabled', 'revoked')),
     PRIMARY KEY(network_id, node_id),
     UNIQUE(network_id, signing_public_key_hex)
 );
+ALTER TABLE registration_nodes
+    DROP CONSTRAINT IF EXISTS registration_nodes_status_check;
+WITH applied AS (
+    INSERT INTO registration_schema_migrations(migration_id, applied_at)
+    VALUES ('20260825_migrate_automatic_node_revocation_to_stale', CURRENT_TIMESTAMP)
+    ON CONFLICT (migration_id) DO NOTHING
+    RETURNING migration_id
+)
+UPDATE registration_nodes
+SET status = 'stale'
+WHERE status = 'revoked'
+  AND EXISTS (SELECT 1 FROM applied);
+ALTER TABLE registration_nodes
+    ADD CONSTRAINT registration_nodes_status_check
+    CHECK(status IN ('active', 'stale', 'disabled', 'revoked'));
 CREATE INDEX IF NOT EXISTS registration_nodes_status_index
     ON registration_nodes(network_id, status, last_seen_at_ms DESC);
 CREATE INDEX IF NOT EXISTS registration_nodes_expiry_index
@@ -206,16 +231,83 @@ CREATE TABLE IF NOT EXISTS registration_node_agents (
     agent_card_json TEXT,
     agent_card_hash TEXT,
     relation_status TEXT NOT NULL DEFAULT 'pending'
-        CHECK(relation_status IN ('pending', 'active', 'disabled', 'revoked')),
+        CHECK(relation_status IN ('pending', 'active', 'superseded')),
     first_seen_at_ms TIMESTAMPTZ NOT NULL,
     last_seen_at_ms TIMESTAMPTZ NOT NULL,
     created_at_ms TIMESTAMPTZ NOT NULL,
     updated_at_ms TIMESTAMPTZ NOT NULL,
-    disabled_at_ms TIMESTAMPTZ,
     PRIMARY KEY(network_id, node_id, agent_did)
 );
 ALTER TABLE registration_node_agents
     DROP COLUMN IF EXISTS request_id;
+ALTER TABLE registration_node_agents
+    DROP CONSTRAINT IF EXISTS registration_node_agents_relation_status_check;
+UPDATE registration_node_agents AS links
+SET relation_status = CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM registration_agents AS agents
+            WHERE agents.network_id = links.network_id
+              AND agents.agent_did = links.agent_did
+        ) THEN 'active'
+        ELSE 'pending'
+    END
+WHERE relation_status IN ('disabled', 'revoked');
+WITH discovered_bindings AS (
+    SELECT nodes.network_id,
+           nodes.node_id,
+           nodes.discovery_record_json::jsonb
+               #>> '{body,source_agent_card,agent_id}' AS agent_did,
+           ROW_NUMBER() OVER (
+               PARTITION BY nodes.network_id,
+                            nodes.discovery_record_json::jsonb
+                                #>> '{body,source_agent_card,agent_id}'
+               ORDER BY nodes.record_updated_at_ms DESC, nodes.node_id ASC
+           ) AS agent_binding_rank
+    FROM registration_nodes AS nodes
+    WHERE NULLIF(
+              nodes.discovery_record_json::jsonb
+                  #>> '{body,source_agent_card,agent_id}',
+              ''
+          ) IS NOT NULL
+), selected_bindings AS (
+    SELECT network_id, node_id, agent_did
+    FROM discovered_bindings
+    WHERE agent_binding_rank = 1
+)
+UPDATE registration_node_agents AS links
+SET relation_status = CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM selected_bindings AS selected
+            WHERE selected.network_id = links.network_id
+              AND selected.node_id = links.node_id
+              AND selected.agent_did = links.agent_did
+        ) THEN CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM registration_agents AS agents
+                WHERE agents.network_id = links.network_id
+                  AND agents.agent_did = links.agent_did
+            ) THEN 'active'
+            ELSE 'pending'
+        END
+        WHEN EXISTS (
+            SELECT 1
+            FROM discovered_bindings AS discovered
+            WHERE discovered.network_id = links.network_id
+              AND (
+                  discovered.node_id = links.node_id
+                  OR discovered.agent_did = links.agent_did
+              )
+        ) THEN 'superseded'
+        ELSE links.relation_status
+    END;
+ALTER TABLE registration_node_agents
+    ADD CONSTRAINT registration_node_agents_relation_status_check
+    CHECK(relation_status IN ('pending', 'active', 'superseded'));
+ALTER TABLE registration_node_agents
+    DROP COLUMN IF EXISTS disabled_at_ms;
 CREATE INDEX IF NOT EXISTS registration_node_agents_agent_index
     ON registration_node_agents(network_id, agent_did, relation_status);
 CREATE INDEX IF NOT EXISTS registration_node_agents_node_index
@@ -309,8 +401,8 @@ BEGIN
 END
 $$;
 UPDATE registration_credentials
-SET status = 'revoked',
-    revoked_at_ms = COALESCE(revoked_at_ms, CURRENT_TIMESTAMP),
+SET status = 'expired',
+    revoked_at_ms = NULL,
     updated_at_ms = CURRENT_TIMESTAMP
 WHERE status = 'active'
   AND NOT (credential_json::jsonb ? 'issuer_key_certificate');
@@ -325,27 +417,33 @@ WHERE status IN ('approved', 'disabled')
       WHERE credentials.request_id = requests.request_id
         AND NOT (credentials.credential_json::jsonb ? 'issuer_key_certificate')
   );
+UPDATE registration_credentials
+SET status = 'expired',
+    updated_at_ms = CURRENT_TIMESTAMP
+WHERE status = 'active'
+  AND expires_at_ms IS NOT NULL
+  AND expires_at_ms <= CURRENT_TIMESTAMP;
+WITH applied AS (
+    INSERT INTO registration_schema_migrations(migration_id, applied_at)
+    VALUES ('20260825_restore_discovery_revoked_agents', CURRENT_TIMESTAMP)
+    ON CONFLICT (migration_id) DO NOTHING
+    RETURNING migration_id
+)
 UPDATE registration_agents AS agents
-SET status = 'disabled',
-    disabled_at_ms = COALESCE(disabled_at_ms, CURRENT_TIMESTAMP),
+SET status = 'active',
+    disabled_at_ms = NULL,
     updated_at_ms = CURRENT_TIMESTAMP
-WHERE EXISTS (
-    SELECT 1
-    FROM registration_credentials AS credentials
-    WHERE credentials.credential_id = agents.credential_id
-      AND NOT (credentials.credential_json::jsonb ? 'issuer_key_certificate')
-);
-UPDATE registration_node_agents AS relations
-SET relation_status = 'disabled',
-    disabled_at_ms = COALESCE(disabled_at_ms, CURRENT_TIMESTAMP),
-    updated_at_ms = CURRENT_TIMESTAMP
-WHERE EXISTS (
-    SELECT 1
-    FROM registration_agents AS agents
-    WHERE agents.network_id = relations.network_id
-      AND agents.agent_did = relations.agent_did
-      AND agents.status = 'disabled'
-);
+FROM registration_credentials AS credentials
+WHERE EXISTS (SELECT 1 FROM applied)
+  AND agents.status = 'revoked'
+  AND credentials.credential_id = agents.credential_id
+  AND credentials.network_id = agents.network_id
+  AND credentials.agent_did = agents.agent_did
+  AND credentials.status = 'active'
+  AND (
+      credentials.expires_at_ms IS NULL
+      OR credentials.expires_at_ms > CURRENT_TIMESTAMP
+  );
 "#;
 
 const REGISTRATION_MODE_AUTO: &str = "auto";
@@ -379,13 +477,13 @@ const TIMESTAMP_COLUMNS: &[(&str, &str)] = &[
     ("registration_node_agents", "last_seen_at_ms"),
     ("registration_node_agents", "created_at_ms"),
     ("registration_node_agents", "updated_at_ms"),
-    ("registration_node_agents", "disabled_at_ms"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationAgentStatus {
     Active,
     Disabled,
+    Revoked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,7 +528,6 @@ pub struct NetworkAuthorityInitializationResult {
     pub signing_key: RegistrationSigningKeyRecord,
     pub revoked_credentials: u64,
     pub disabled_agents: u64,
-    pub disabled_node_agents: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +570,8 @@ pub struct RegistrationAgentRecord {
 #[serde(rename_all = "snake_case")]
 pub enum RegistrationNodeStatus {
     Active,
+    Stale,
+    Disabled,
     Revoked,
 }
 
@@ -494,8 +593,7 @@ pub struct RegistrationNodeRecord {
 pub enum NodeAgentRelationStatus {
     Pending,
     Active,
-    Disabled,
-    Revoked,
+    Superseded,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -508,7 +606,6 @@ pub struct RegistrationNodeAgentRecord {
     pub last_seen_at_ms: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    pub disabled_at_ms: Option<u64>,
 }
 
 struct MemoryState {
@@ -816,8 +913,14 @@ impl RegistryStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("registry database mutex poisoned"))?;
         match &mut *backend {
-            Backend::Postgres(client) => get_credential_postgres(client.as_mut(), credential_id),
-            Backend::Memory(state) => Ok(state.credentials.get(credential_id).cloned()),
+            Backend::Postgres(client) => {
+                expire_credentials_postgres(client.as_mut(), now_ms())?;
+                get_credential_postgres(client.as_mut(), credential_id)
+            }
+            Backend::Memory(state) => {
+                expire_credentials_memory(state, now_ms());
+                Ok(state.credentials.get(credential_id).cloned())
+            }
         }
     }
 
@@ -849,7 +952,10 @@ impl RegistryStore {
             .map_err(|_| anyhow::anyhow!("registry database mutex poisoned"))?;
         match &mut *backend {
             Backend::Postgres(client) => {
-                upsert_discovery_node_postgres(client.as_mut(), record, now_ms)
+                let mut transaction = client.transaction()?;
+                let node = upsert_discovery_node_postgres(&mut transaction, record, now_ms)?;
+                transaction.commit()?;
+                Ok(node)
             }
             Backend::Memory(state) => upsert_discovery_node_memory(state, record, now_ms),
         }
@@ -866,10 +972,12 @@ impl RegistryStore {
             .map_err(|_| anyhow::anyhow!("registry database mutex poisoned"))?;
         match &mut *backend {
             Backend::Postgres(client) => {
+                expire_credentials_postgres(client.as_mut(), now_ms())?;
                 expire_discovery_nodes_postgres(client.as_mut(), now_ms())?;
                 get_node_postgres(client.as_mut(), network_id, node_id)
             }
             Backend::Memory(state) => {
+                expire_credentials_memory(state, now_ms());
                 expire_discovery_nodes_memory(state, now_ms());
                 Ok(state
                     .nodes
@@ -893,10 +1001,12 @@ impl RegistryStore {
             .map_err(|_| anyhow::anyhow!("registry database mutex poisoned"))?;
         match &mut *backend {
             Backend::Postgres(client) => {
+                expire_credentials_postgres(client.as_mut(), now_ms())?;
                 expire_discovery_nodes_postgres(client.as_mut(), now_ms())?;
                 list_nodes_postgres(client, network_id, status, limit)
             }
             Backend::Memory(state) => {
+                expire_credentials_memory(state, now_ms());
                 expire_discovery_nodes_memory(state, now_ms());
                 list_nodes_memory(
                     &state.nodes,
@@ -949,10 +1059,12 @@ impl RegistryStore {
             .map_err(|_| anyhow::anyhow!("registry database mutex poisoned"))?;
         match &mut *backend {
             Backend::Postgres(client) => {
+                expire_credentials_postgres(client.as_mut(), now_ms())?;
                 expire_discovery_nodes_postgres(client.as_mut(), now_ms())?;
                 list_node_agents_postgres(client, network_id, node_id, limit, true)
             }
             Backend::Memory(state) => {
+                expire_credentials_memory(state, now_ms());
                 expire_discovery_nodes_memory(state, now_ms());
                 Ok(state
                     .node_agents
@@ -1110,36 +1222,14 @@ fn migrate_authority_ids(client: &mut Client) -> Result<()> {
          UPDATE registration_credentials AS credentials
             SET issuer_authority_id = authorities.authority_id,
                 status = CASE
-                    WHEN credentials.status = 'active' THEN 'revoked'
+                    WHEN credentials.status = 'active' THEN 'expired'
                     ELSE credentials.status
                 END,
-                revoked_at_ms = CASE
-                    WHEN credentials.status = 'active'
-                    THEN COALESCE(credentials.revoked_at_ms, CURRENT_TIMESTAMP)
-                    ELSE credentials.revoked_at_ms
-                END,
+                revoked_at_ms = NULL,
                 updated_at_ms = CURRENT_TIMESTAMP
            FROM registration_networks_authorities AS authorities
           WHERE authorities.network_id = credentials.network_id
             AND credentials.issuer_authority_id <> authorities.authority_id;
-         UPDATE registration_agents AS agents
-            SET status = 'disabled',
-                disabled_at_ms = COALESCE(agents.disabled_at_ms, CURRENT_TIMESTAMP),
-                updated_at_ms = CURRENT_TIMESTAMP
-          WHERE agents.status = 'active'
-            AND agents.credential_id IN (
-                SELECT credential_id FROM watt_registry_migrated_credentials
-            );
-         UPDATE registration_node_agents AS links
-            SET relation_status = 'disabled',
-                disabled_at_ms = COALESCE(links.disabled_at_ms, CURRENT_TIMESTAMP),
-                updated_at_ms = CURRENT_TIMESTAMP
-           FROM registration_agents AS agents
-          WHERE links.network_id = agents.network_id
-            AND links.agent_did = agents.agent_did
-            AND agents.credential_id IN (
-                SELECT credential_id FROM watt_registry_migrated_credentials
-            );
          UPDATE registration_requests AS requests
             SET status = 'rejected',
                 review_note = 'credential issuer authority migrated; registration must be resubmitted',
@@ -1389,6 +1479,7 @@ fn initialize_or_rotate_network_authority_postgres(
     now_ms: u64,
 ) -> Result<NetworkAuthorityInitializationResult> {
     let mut transaction = client.transaction()?;
+    expire_credentials_postgres(&mut transaction, now_ms)?;
     let existing = get_network_authority_postgres(&mut transaction, &config.network_id)?;
     let authority_changed = existing.as_ref().is_some_and(|authority| {
         authority.genesis_node_id != config.genesis_node_id
@@ -1474,7 +1565,7 @@ fn initialize_or_rotate_network_authority_postgres(
         ],
     )?;
 
-    let (revoked_credentials, disabled_agents, disabled_node_agents) = if authority_changed {
+    let (revoked_credentials, disabled_agents) = if authority_changed {
         let revoked_credentials = transaction.execute(
             "UPDATE registration_credentials
              SET status = 'revoked', revoked_at_ms = $2, updated_at_ms = $2
@@ -1487,15 +1578,9 @@ fn initialize_or_rotate_network_authority_postgres(
              WHERE network_id = $1 AND status = 'active'",
             &[&config.network_id, &timestamp],
         )?;
-        let disabled_node_agents = transaction.execute(
-            "UPDATE registration_node_agents
-             SET relation_status = 'disabled', disabled_at_ms = $2, updated_at_ms = $2
-             WHERE network_id = $1 AND relation_status = 'active'",
-            &[&config.network_id, &timestamp],
-        )?;
-        (revoked_credentials, disabled_agents, disabled_node_agents)
+        (revoked_credentials, disabled_agents)
     } else {
-        (0, 0, 0)
+        (0, 0)
     };
 
     let authority = get_network_authority_postgres(&mut transaction, &config.network_id)?
@@ -1508,7 +1593,6 @@ fn initialize_or_rotate_network_authority_postgres(
         signing_key,
         revoked_credentials,
         disabled_agents,
-        disabled_node_agents,
     })
 }
 
@@ -1517,6 +1601,7 @@ fn initialize_or_rotate_network_authority_memory(
     config: &NetworkAuthorityConfig,
     now_ms: u64,
 ) -> Result<NetworkAuthorityInitializationResult> {
+    expire_credentials_memory(state, now_ms);
     let authority_changed = state
         .authorities
         .get(&config.network_id)
@@ -1586,7 +1671,6 @@ fn initialize_or_rotate_network_authority_memory(
 
     let mut revoked_credentials = 0;
     let mut disabled_agents = 0;
-    let mut disabled_node_agents = 0;
     if authority_changed {
         for credential in state.credentials.values_mut() {
             if credential.network_id == config.network_id && credential.status == "active" {
@@ -1606,16 +1690,6 @@ fn initialize_or_rotate_network_authority_memory(
                 disabled_agents += 1;
             }
         }
-        for node_agent in state.node_agents.values_mut() {
-            if node_agent.network_id == config.network_id
-                && node_agent.relation_status == NodeAgentRelationStatus::Active
-            {
-                node_agent.relation_status = NodeAgentRelationStatus::Disabled;
-                node_agent.disabled_at_ms = Some(now_ms);
-                node_agent.updated_at_ms = now_ms;
-                disabled_node_agents += 1;
-            }
-        }
     }
     let authority = state
         .authorities
@@ -1632,7 +1706,6 @@ fn initialize_or_rotate_network_authority_memory(
         signing_key,
         revoked_credentials,
         disabled_agents,
-        disabled_node_agents,
     })
 }
 
@@ -2053,12 +2126,6 @@ fn transition_postgres(
                 RegistrationAgentStatus::Disabled,
                 now_ms,
             )?;
-            disable_node_agent_links_postgres(
-                &mut transaction,
-                &current.request.network_id,
-                &current.request.agent_did,
-                now_ms,
-            )?;
         }
         RegistrationStatus::Draft | RegistrationStatus::Pending | RegistrationStatus::Rejected => {}
     }
@@ -2153,10 +2220,10 @@ fn transition_memory(
         for link in state.node_agents.values_mut().filter(|link| {
             link.network_id == record.request.network_id
                 && link.agent_did == record.request.agent_did
+                && link.relation_status == NodeAgentRelationStatus::Pending
         }) {
             link.relation_status = NodeAgentRelationStatus::Active;
             link.updated_at_ms = now_ms;
-            link.disabled_at_ms = None;
         }
     } else if next_status == RegistrationStatus::Disabled {
         let key = (
@@ -2179,14 +2246,6 @@ fn transition_memory(
             credential.revoked_at_ms = Some(now_ms);
             credential.updated_at_ms = now_ms;
         }
-        for link in state.node_agents.values_mut().filter(|link| {
-            link.network_id == record.request.network_id
-                && link.agent_did == record.request.agent_did
-        }) {
-            link.relation_status = NodeAgentRelationStatus::Disabled;
-            link.updated_at_ms = now_ms;
-            link.disabled_at_ms = Some(now_ms);
-        }
     }
     state.requests.insert(request_id.to_owned(), record.clone());
     Ok(record.clone())
@@ -2194,36 +2253,9 @@ fn transition_memory(
 
 fn invalidate_legacy_agents_postgres(client: &mut Client) -> Result<()> {
     // Existing credentials were signed by the previous Genesis authority. They
-    // are deliberately not copied into registration_credentials; every Agent
-    // must receive a new credential from the current authority.
-    client.execute(
-        "UPDATE registration_agents AS agents
-         SET status = 'disabled',
-             disabled_at_ms = COALESCE(agents.disabled_at_ms, CURRENT_TIMESTAMP),
-             updated_at_ms = CURRENT_TIMESTAMP
-         WHERE agents.status = 'active'
-           AND NOT EXISTS (
-               SELECT 1
-               FROM registration_credentials AS credentials
-               WHERE credentials.credential_id = agents.credential_id
-           )",
-        &[],
-    )?;
-    client.execute(
-        "UPDATE registration_node_agents AS links
-         SET relation_status = 'disabled',
-             disabled_at_ms = COALESCE(links.disabled_at_ms, CURRENT_TIMESTAMP),
-             updated_at_ms = CURRENT_TIMESTAMP
-         WHERE links.relation_status = 'active'
-           AND EXISTS (
-               SELECT 1
-               FROM registration_agents AS agents
-               WHERE agents.network_id = links.network_id
-                 AND agents.agent_did = links.agent_did
-                 AND agents.status = 'disabled'
-           )",
-        &[],
-    )?;
+    // are deliberately not copied into registration_credentials. The Agent's
+    // registration remains active, but it cannot be discovered without a
+    // current active credential and must register again.
     // Release the old request's active uniqueness slots. The request row is
     // retained as audit history, but it must no longer block a fresh request
     // after the Genesis authority rotation.
@@ -2314,6 +2346,33 @@ fn revoke_credentials_postgres<C: GenericClient + ?Sized>(
     Ok(())
 }
 
+fn expire_credentials_postgres<C: GenericClient + ?Sized>(
+    client: &mut C,
+    now_ms: u64,
+) -> Result<()> {
+    client.execute(
+        "UPDATE registration_credentials
+         SET status = 'expired', updated_at_ms = $1
+         WHERE status = 'active'
+           AND expires_at_ms IS NOT NULL
+           AND expires_at_ms <= $1",
+        &[&timestamp_from_ms(now_ms)],
+    )?;
+    Ok(())
+}
+
+fn expire_credentials_memory(state: &mut MemoryState, now_ms: u64) {
+    for credential in state.credentials.values_mut().filter(|credential| {
+        credential.status == "active"
+            && credential
+                .expires_at_ms
+                .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+    }) {
+        credential.status = "expired".to_owned();
+        credential.updated_at_ms = now_ms;
+    }
+}
+
 fn upsert_agent_postgres<C: GenericClient + ?Sized>(
     client: &mut C,
     request: &RegistrationRequest,
@@ -2324,7 +2383,7 @@ fn upsert_agent_postgres<C: GenericClient + ?Sized>(
     updated_at_ms: u64,
 ) -> Result<RegistrationAgentRecord> {
     let disabled_at_ms = match status {
-        RegistrationAgentStatus::Active => None,
+        RegistrationAgentStatus::Active | RegistrationAgentStatus::Revoked => None,
         RegistrationAgentStatus::Disabled => Some(timestamp_from_ms(updated_at_ms)),
     };
     client.execute(
@@ -2378,7 +2437,7 @@ fn update_agent_status_postgres<C: GenericClient + ?Sized>(
     now_ms: u64,
 ) -> Result<()> {
     let disabled_at_ms = match status {
-        RegistrationAgentStatus::Active => None,
+        RegistrationAgentStatus::Active | RegistrationAgentStatus::Revoked => None,
         RegistrationAgentStatus::Disabled => Some(timestamp_from_ms(now_ms)),
     };
     let updated = client.execute(
@@ -2420,7 +2479,9 @@ fn update_agent_nickname_memory(
             && existing.agent_did != agent_did
             && matches!(
                 existing.status,
-                RegistrationAgentStatus::Active | RegistrationAgentStatus::Disabled
+                RegistrationAgentStatus::Active
+                    | RegistrationAgentStatus::Disabled
+                    | RegistrationAgentStatus::Revoked
             )
     }) {
         bail!("agent or nickname already has an active registration");
@@ -2636,12 +2697,22 @@ fn upsert_discovery_node_memory(
         return Ok(existing.clone());
     }
     let existing = state.nodes.get(&key).cloned();
+    let status = existing
+        .as_ref()
+        .map(|node| match node.status {
+            RegistrationNodeStatus::Disabled => RegistrationNodeStatus::Disabled,
+            RegistrationNodeStatus::Revoked => RegistrationNodeStatus::Revoked,
+            RegistrationNodeStatus::Active | RegistrationNodeStatus::Stale => {
+                RegistrationNodeStatus::Active
+            }
+        })
+        .unwrap_or(RegistrationNodeStatus::Active);
     let node = RegistrationNodeRecord {
         network_id: record.body.network_id.clone(),
         node_id: record.body.node_id.clone(),
         signing_public_key_hex: record.body.signing_public_key_hex.clone(),
         record: record.clone(),
-        status: RegistrationNodeStatus::Active,
+        status,
         first_seen_at_ms: existing
             .as_ref()
             .map(|node| node.first_seen_at_ms)
@@ -2671,16 +2742,21 @@ fn sync_discovered_agent_link_memory(
         record.body.node_id.clone(),
         details.agent_did.clone(),
     );
+    supersede_conflicting_node_agent_links_memory(
+        state,
+        &record.body.network_id,
+        &record.body.node_id,
+        &details.agent_did,
+        now_ms,
+    );
     let existing = state.node_agents.get(&key).cloned();
-    let relation_status = match state
+    let relation_status = if state
         .agents
-        .get(&(record.body.network_id.clone(), details.agent_did.clone()))
+        .contains_key(&(record.body.network_id.clone(), details.agent_did.clone()))
     {
-        Some(agent) => match agent.status {
-            RegistrationAgentStatus::Active => NodeAgentRelationStatus::Active,
-            RegistrationAgentStatus::Disabled => NodeAgentRelationStatus::Disabled,
-        },
-        None => NodeAgentRelationStatus::Pending,
+        NodeAgentRelationStatus::Active
+    } else {
+        NodeAgentRelationStatus::Pending
     };
     if let Some(agent) = state
         .agents
@@ -2707,14 +2783,27 @@ fn sync_discovered_agent_link_memory(
             .map(|link| link.created_at_ms)
             .unwrap_or(now_ms),
         updated_at_ms: now_ms,
-        disabled_at_ms: if relation_status == NodeAgentRelationStatus::Disabled {
-            Some(now_ms)
-        } else {
-            None
-        },
     };
     state.node_agents.insert(key, link);
     Ok(())
+}
+
+fn supersede_conflicting_node_agent_links_memory(
+    state: &mut MemoryState,
+    network_id: &str,
+    node_id: &str,
+    agent_did: &str,
+    now_ms: u64,
+) {
+    for link in state.node_agents.values_mut().filter(|link| {
+        link.network_id == network_id
+            && link.relation_status != NodeAgentRelationStatus::Superseded
+            && ((link.node_id == node_id && link.agent_did != agent_did)
+                || (link.agent_did == agent_did && link.node_id != node_id))
+    }) {
+        link.relation_status = NodeAgentRelationStatus::Superseded;
+        link.updated_at_ms = now_ms;
+    }
 }
 
 fn upsert_discovery_node_postgres<C: GenericClient + ?Sized>(
@@ -2772,7 +2861,11 @@ fn upsert_discovery_node_postgres<C: GenericClient + ?Sized>(
              record_signature_hex = EXCLUDED.record_signature_hex,
              last_seen_at_ms = EXCLUDED.last_seen_at_ms,
              updated_at_ms = EXCLUDED.updated_at_ms,
-             status = 'active'",
+             status = CASE
+                 WHEN registration_nodes.status IN ('disabled', 'revoked')
+                     THEN registration_nodes.status
+                 ELSE 'active'
+             END",
         &[
             &body.network_id,
             &body.node_id,
@@ -2804,21 +2897,25 @@ fn sync_discovered_agent_link_postgres<C: GenericClient + ?Sized>(
     let Some(details) = source_agent_details(record)? else {
         return Ok(());
     };
-    let relation_status = match client.query_opt(
-        "SELECT status
+    supersede_conflicting_node_agent_links_postgres(
+        client,
+        &record.body.network_id,
+        &record.body.node_id,
+        &details.agent_did,
+        now_ms,
+    )?;
+    let relation_status = if client
+        .query_opt(
+            "SELECT 1
          FROM registration_agents
          WHERE network_id = $1 AND agent_did = $2",
-        &[&record.body.network_id, &details.agent_did],
-    )? {
-        Some(row) => {
-            let status: String = row.try_get(0)?;
-            match status.as_str() {
-                "active" => "active",
-                "disabled" => "disabled",
-                _ => "pending",
-            }
-        }
-        None => "pending",
+            &[&record.body.network_id, &details.agent_did],
+        )?
+        .is_some()
+    {
+        "active"
+    } else {
+        "pending"
     };
     if let Some(source_agent_card) = details.source_agent_card.as_ref() {
         let card_json = serde_json::to_string(source_agent_card)?;
@@ -2842,21 +2939,44 @@ fn sync_discovered_agent_link_postgres<C: GenericClient + ?Sized>(
         "INSERT INTO registration_node_agents(
              network_id, node_id, agent_did,
              relation_status,
-             first_seen_at_ms, last_seen_at_ms, created_at_ms, updated_at_ms,
-             disabled_at_ms
-         ) VALUES ($1, $2, $3, $4, $5, $5, $5, $5, $6)
+             first_seen_at_ms, last_seen_at_ms, created_at_ms, updated_at_ms
+         ) VALUES ($1, $2, $3, $4, $5, $5, $5, $5)
          ON CONFLICT (network_id, node_id, agent_did) DO UPDATE SET
              relation_status = EXCLUDED.relation_status,
              last_seen_at_ms = EXCLUDED.last_seen_at_ms,
-             updated_at_ms = EXCLUDED.updated_at_ms,
-             disabled_at_ms = EXCLUDED.disabled_at_ms",
+             updated_at_ms = EXCLUDED.updated_at_ms",
         &[
             &record.body.network_id,
             &record.body.node_id,
             &details.agent_did,
             &relation_status,
             &timestamp_from_ms(now_ms),
-            &((relation_status == "disabled").then(|| timestamp_from_ms(now_ms))),
+        ],
+    )?;
+    Ok(())
+}
+
+fn supersede_conflicting_node_agent_links_postgres<C: GenericClient + ?Sized>(
+    client: &mut C,
+    network_id: &str,
+    node_id: &str,
+    agent_did: &str,
+    now_ms: u64,
+) -> Result<()> {
+    client.execute(
+        "UPDATE registration_node_agents
+         SET relation_status = 'superseded', updated_at_ms = $4
+         WHERE network_id = $1
+           AND relation_status <> 'superseded'
+           AND (
+               (node_id = $2 AND agent_did <> $3)
+               OR (agent_did = $3 AND node_id <> $2)
+           )",
+        &[
+            &network_id,
+            &node_id,
+            &agent_did,
+            &timestamp_from_ms(now_ms),
         ],
     )?;
     Ok(())
@@ -2871,29 +2991,13 @@ fn activate_node_agent_links_postgres<C: GenericClient + ?Sized>(
     client.execute(
         "UPDATE registration_node_agents AS links
          SET relation_status = 'active',
-             updated_at_ms = $3,
-             disabled_at_ms = NULL
+             updated_at_ms = $3
          FROM registration_agents AS agents
          WHERE links.network_id = $1 AND links.agent_did = $2
            AND agents.network_id = links.network_id
            AND agents.agent_did = links.agent_did
            AND agents.status = 'active'
-           AND links.relation_status <> 'revoked'",
-        &[&network_id, &agent_did, &timestamp_from_ms(now_ms)],
-    )?;
-    Ok(())
-}
-
-fn disable_node_agent_links_postgres<C: GenericClient + ?Sized>(
-    client: &mut C,
-    network_id: &str,
-    agent_did: &str,
-    now_ms: u64,
-) -> Result<()> {
-    client.execute(
-        "UPDATE registration_node_agents
-         SET relation_status = 'disabled', updated_at_ms = $3, disabled_at_ms = $3
-         WHERE network_id = $1 AND agent_did = $2 AND relation_status <> 'revoked'",
+           AND links.relation_status = 'pending'",
         &[&network_id, &agent_did, &timestamp_from_ms(now_ms)],
     )?;
     Ok(())
@@ -2906,49 +3010,19 @@ fn expire_discovery_nodes_postgres<C: GenericClient + ?Sized>(
     let now = timestamp_from_ms(now_ms);
     client.execute(
         "UPDATE registration_nodes
-         SET status = 'revoked', updated_at_ms = $1
+         SET status = 'stale', updated_at_ms = $1
          WHERE status = 'active' AND record_expires_at_ms <= $1",
-        &[&now],
-    )?;
-    client.execute(
-        "UPDATE registration_node_agents AS links
-         SET relation_status = 'revoked', updated_at_ms = $1
-         WHERE links.relation_status = 'active'
-           AND EXISTS (
-               SELECT 1
-               FROM registration_nodes AS nodes
-               WHERE nodes.network_id = links.network_id
-                 AND nodes.node_id = links.node_id
-                 AND nodes.status = 'revoked'
-           )",
         &[&now],
     )?;
     Ok(())
 }
 
 fn expire_discovery_nodes_memory(state: &mut MemoryState, now_ms: u64) {
-    let expired = state
-        .nodes
-        .values_mut()
-        .filter(|node| {
-            node.status == RegistrationNodeStatus::Active
-                && node.record.body.expires_at_ms() <= now_ms
-        })
-        .map(|node| {
-            node.status = RegistrationNodeStatus::Revoked;
-            node.updated_at_ms = now_ms;
-            (node.network_id.clone(), node.node_id.clone())
-        })
-        .collect::<Vec<_>>();
-    for (network_id, node_id) in expired {
-        for link in state.node_agents.values_mut().filter(|link| {
-            link.network_id == network_id
-                && link.node_id == node_id
-                && link.relation_status == NodeAgentRelationStatus::Active
-        }) {
-            link.relation_status = NodeAgentRelationStatus::Revoked;
-            link.updated_at_ms = now_ms;
-        }
+    for node in state.nodes.values_mut().filter(|node| {
+        node.status == RegistrationNodeStatus::Active && node.record.body.expires_at_ms() <= now_ms
+    }) {
+        node.status = RegistrationNodeStatus::Stale;
+        node.updated_at_ms = now_ms;
     }
 }
 
@@ -3099,8 +3173,7 @@ fn list_node_agents_postgres(
     let relation_status = visible_only.then_some("active");
     let rows = client.query(
         "SELECT network_id, node_id, agent_did, relation_status,
-                first_seen_at_ms, last_seen_at_ms, created_at_ms, updated_at_ms,
-                disabled_at_ms
+                first_seen_at_ms, last_seen_at_ms, created_at_ms, updated_at_ms
          FROM registration_node_agents
          WHERE network_id = $1 AND node_id = $2
            AND ($4::TEXT IS NULL OR relation_status = $4)
@@ -3180,7 +3253,6 @@ fn row_to_node_agent(row: &Row) -> Result<RegistrationNodeAgentRecord> {
         last_seen_at_ms: row_timestamp_ms(row, 5)?,
         created_at_ms: row_timestamp_ms(row, 6)?,
         updated_at_ms: row_timestamp_ms(row, 7)?,
-        disabled_at_ms: row_optional_timestamp_ms(row, 8)?,
     })
 }
 
@@ -3348,6 +3420,7 @@ fn agent_status_string(status: RegistrationAgentStatus) -> &'static str {
     match status {
         RegistrationAgentStatus::Active => "active",
         RegistrationAgentStatus::Disabled => "disabled",
+        RegistrationAgentStatus::Revoked => "revoked",
     }
 }
 
@@ -3355,6 +3428,7 @@ fn parse_agent_status(value: &str) -> Result<RegistrationAgentStatus> {
     match value {
         "active" => Ok(RegistrationAgentStatus::Active),
         "disabled" => Ok(RegistrationAgentStatus::Disabled),
+        "revoked" => Ok(RegistrationAgentStatus::Revoked),
         other => bail!("unknown registration agent status '{other}'"),
     }
 }
@@ -3362,6 +3436,8 @@ fn parse_agent_status(value: &str) -> Result<RegistrationAgentStatus> {
 fn node_status_string(status: RegistrationNodeStatus) -> &'static str {
     match status {
         RegistrationNodeStatus::Active => "active",
+        RegistrationNodeStatus::Stale => "stale",
+        RegistrationNodeStatus::Disabled => "disabled",
         RegistrationNodeStatus::Revoked => "revoked",
     }
 }
@@ -3369,6 +3445,8 @@ fn node_status_string(status: RegistrationNodeStatus) -> &'static str {
 fn parse_node_status(value: &str) -> Result<RegistrationNodeStatus> {
     match value {
         "active" => Ok(RegistrationNodeStatus::Active),
+        "stale" => Ok(RegistrationNodeStatus::Stale),
+        "disabled" => Ok(RegistrationNodeStatus::Disabled),
         "revoked" => Ok(RegistrationNodeStatus::Revoked),
         other => bail!("unknown registration node status '{other}'"),
     }
@@ -3378,8 +3456,7 @@ fn parse_node_agent_relation_status(value: &str) -> Result<NodeAgentRelationStat
     match value {
         "pending" => Ok(NodeAgentRelationStatus::Pending),
         "active" => Ok(NodeAgentRelationStatus::Active),
-        "disabled" => Ok(NodeAgentRelationStatus::Disabled),
-        "revoked" => Ok(NodeAgentRelationStatus::Revoked),
+        "superseded" => Ok(NodeAgentRelationStatus::Superseded),
         other => bail!("unknown node-agent relation status '{other}'"),
     }
 }
@@ -3532,23 +3609,26 @@ mod tests {
     }
 
     fn discovery_record(agent_did: &str, seq: u64) -> SignedDiscoveryNodeRecord {
-        let node_id = "node-a".to_owned();
+        discovery_record_for("node-a", agent_did, seq)
+    }
+
+    fn discovery_record_for(node_id: &str, agent_did: &str, seq: u64) -> SignedDiscoveryNodeRecord {
         SignedDiscoveryNodeRecord {
             body: DiscoveryNodeRecordBody {
                 protocol_version: DISCOVERY_PROTOCOL_VERSION.to_owned(),
                 network_id: "network-1".to_owned(),
-                node_id,
-                signing_public_key_hex: "node-a-public-key".to_owned(),
+                node_id: node_id.to_owned(),
+                signing_public_key_hex: format!("{node_id}-public-key"),
                 seq,
                 updated_at_ms: 1_000 + seq,
                 ttl_ms: 5_000,
                 geo: None,
                 capabilities: json!({"services": ["wattswarm.node"]}),
                 topic_providers: Vec::new(),
-                transport_contact: Some(json!({"peer_id": "node-a"})),
+                transport_contact: Some(json!({"peer_id": node_id})),
                 source_agent_card: Some(json!({
                     "agent_id": agent_did,
-                    "node_id": "node-a",
+                    "node_id": node_id,
                     "card_hash": "sha256:test",
                     "issued_at": 1_000,
                     "card": {"name": "Test Agent"},
@@ -3810,6 +3890,37 @@ mod tests {
             .expect("authority lookup")
             .expect("network authority")
             .authority_id;
+        let agent = request("rotated-agent", "Rotated Agent");
+        store
+            .insert_request(&agent, RegistrationStatus::Pending, "manual", 11)
+            .expect("insert registration");
+        store
+            .transition(
+                &agent.request_id,
+                RegistrationDecisionKind::Approve,
+                &decision(
+                    &agent,
+                    RegistrationDecisionKind::Approve,
+                    RegistrationStatus::Approved,
+                    12,
+                ),
+                Some(&credential(&agent, "credential-before-rotation")),
+                12,
+            )
+            .expect("approve registration");
+        let mut binding_record = discovery_record(&agent.agent_did, 1);
+        let binding_seen_at_ms = now_ms();
+        binding_record.body.updated_at_ms = binding_seen_at_ms;
+        store
+            .upsert_discovery_node(&binding_record, binding_seen_at_ms)
+            .expect("store Agent binding");
+        assert_eq!(
+            store
+                .list_visible_node_agents("network-1", "node-a", 10)
+                .expect("visible binding before authority rotation")
+                .len(),
+            1
+        );
 
         let result = store
             .initialize_or_rotate_network_authority(
@@ -3830,6 +3941,21 @@ mod tests {
         assert_eq!(result.authority.genesis_node_id, "genesis-new");
         assert_eq!(result.authority.active_signing_key_id, "key-new");
         assert_eq!(result.signing_key.public_key_hex, "public-new");
+        assert_eq!(result.revoked_credentials, 1);
+        assert_eq!(result.disabled_agents, 1);
+        assert_eq!(
+            store
+                .list_node_agents("network-1", "node-a", 10)
+                .expect("binding after authority rotation")[0]
+                .relation_status,
+            NodeAgentRelationStatus::Active
+        );
+        assert!(
+            store
+                .list_visible_node_agents("network-1", "node-a", 10)
+                .expect("visible bindings after authority rotation")
+                .is_empty()
+        );
         assert_eq!(
             store
                 .get_active_signing_key("network-1")
@@ -3942,6 +4068,48 @@ mod tests {
     }
 
     #[test]
+    fn credential_expiration_does_not_disable_or_revoke_the_agent() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        let agent = request("expiring", "Expiring Agent");
+        store
+            .insert_request(&agent, RegistrationStatus::Pending, "auto", 10)
+            .expect("insert request");
+        let mut expiring_credential = credential(&agent, "credential-expiring");
+        expiring_credential.unsigned.expires_at_ms = Some(50);
+        store
+            .transition(
+                &agent.request_id,
+                RegistrationDecisionKind::Approve,
+                &decision(
+                    &agent,
+                    RegistrationDecisionKind::Approve,
+                    RegistrationStatus::Approved,
+                    20,
+                ),
+                Some(&expiring_credential),
+                20,
+            )
+            .expect("approve registration");
+
+        assert_eq!(
+            store
+                .get_credential("credential-expiring")
+                .expect("credential lookup")
+                .expect("credential")
+                .status,
+            "expired"
+        );
+        assert_eq!(
+            store
+                .get_agent(&agent.network_id, &agent.agent_did)
+                .expect("agent lookup")
+                .expect("agent")
+                .status,
+            RegistrationAgentStatus::Active
+        );
+    }
+
+    #[test]
     fn discovery_nodes_keep_agent_links_pending_until_registration_is_approved() {
         let store = RegistryStore::open_in_memory().expect("store");
         let agent = request("agent", "Node Agent");
@@ -3978,9 +4146,11 @@ mod tests {
             .expect("active node-agent links");
         assert_eq!(active[0].relation_status, NodeAgentRelationStatus::Active);
 
-        let refreshed_record = discovery_record(&agent.agent_did, 2);
+        let mut refreshed_record = discovery_record(&agent.agent_did, 2);
+        let refreshed_at_ms = now_ms();
+        refreshed_record.body.updated_at_ms = refreshed_at_ms;
         store
-            .upsert_discovery_node(&refreshed_record, 2_250)
+            .upsert_discovery_node(&refreshed_record, refreshed_at_ms)
             .expect("refresh registered Agent Card");
         let registered_agent = store
             .get_agent(&agent.network_id, &agent.agent_did)
@@ -3993,6 +4163,13 @@ mod tests {
         assert_eq!(
             registered_agent.agent_card_hash.as_deref(),
             Some("sha256:test")
+        );
+        assert_eq!(
+            store
+                .list_visible_node_agents("network-1", "node-a", 10)
+                .expect("visible binding before Agent disable")
+                .len(),
+            1
         );
 
         store
@@ -4009,12 +4186,364 @@ mod tests {
                 2_300,
             )
             .expect("disable agent");
-        let disabled = store
+        let links_after_disable = store
             .list_node_agents("network-1", "node-a", 10)
-            .expect("disabled node-agent links");
+            .expect("node-agent links after Agent disable");
         assert_eq!(
-            disabled[0].relation_status,
-            NodeAgentRelationStatus::Disabled
+            links_after_disable[0].relation_status,
+            NodeAgentRelationStatus::Active
+        );
+        assert!(
+            store
+                .list_visible_node_agents("network-1", "node-a", 10)
+                .expect("visible bindings after Agent disable")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn discovery_supersedes_previous_agent_when_node_changes_agent_did() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        store
+            .upsert_discovery_node(&discovery_record("did:key:old", 1), 2_000)
+            .expect("store original node-agent relation");
+        store
+            .upsert_discovery_node(&discovery_record("did:key:new", 2), 2_100)
+            .expect("store replacement node-agent relation");
+
+        let links = store
+            .list_node_agents("network-1", "node-a", 10)
+            .expect("node-agent relations");
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links
+                .iter()
+                .find(|link| link.agent_did == "did:key:old")
+                .expect("old relation")
+                .relation_status,
+            NodeAgentRelationStatus::Superseded
+        );
+        assert_eq!(
+            links
+                .iter()
+                .find(|link| link.agent_did == "did:key:new")
+                .expect("new relation")
+                .relation_status,
+            NodeAgentRelationStatus::Pending
+        );
+    }
+
+    #[test]
+    fn discovery_supersedes_previous_node_when_agent_moves_to_another_node() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        store
+            .upsert_discovery_node(&discovery_record_for("node-a", "did:key:agent", 1), 2_000)
+            .expect("store original node-agent relation");
+        store
+            .upsert_discovery_node(&discovery_record_for("node-b", "did:key:agent", 1), 2_100)
+            .expect("store replacement node-agent relation");
+
+        let old_links = store
+            .list_node_agents("network-1", "node-a", 10)
+            .expect("old node relations");
+        assert_eq!(old_links.len(), 1);
+        assert_eq!(
+            old_links[0].relation_status,
+            NodeAgentRelationStatus::Superseded
+        );
+
+        let new_links = store
+            .list_node_agents("network-1", "node-b", 10)
+            .expect("new node relations");
+        assert_eq!(new_links.len(), 1);
+        assert_eq!(
+            new_links[0].relation_status,
+            NodeAgentRelationStatus::Pending
+        );
+    }
+
+    #[test]
+    fn expired_discovery_marks_only_the_node_stale() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        let agent = request("offline-agent", "Offline Agent");
+        store
+            .insert_request(&agent, RegistrationStatus::Pending, "auto", 1_000)
+            .expect("insert agent request");
+        store
+            .transition(
+                &agent.request_id,
+                RegistrationDecisionKind::Approve,
+                &decision(
+                    &agent,
+                    RegistrationDecisionKind::Approve,
+                    RegistrationStatus::Approved,
+                    1_100,
+                ),
+                Some(&credential(&agent, "credential-offline-agent")),
+                1_100,
+            )
+            .expect("approve agent");
+        store
+            .upsert_discovery_node(&discovery_record(&agent.agent_did, 1), 2_000)
+            .expect("store active node-agent relation");
+
+        {
+            let mut backend = store.backend.lock().expect("store lock");
+            let Backend::Memory(state) = &mut *backend else {
+                panic!("expected memory backend");
+            };
+            expire_discovery_nodes_memory(state, 7_000);
+        }
+
+        assert_eq!(
+            store
+                .get_agent(&agent.network_id, &agent.agent_did)
+                .expect("agent lookup")
+                .expect("registered agent")
+                .status,
+            RegistrationAgentStatus::Active
+        );
+        assert_eq!(
+            store
+                .get_credential("credential-offline-agent")
+                .expect("credential lookup")
+                .expect("credential")
+                .status,
+            "active"
+        );
+        assert_eq!(
+            store
+                .list_node_agents("network-1", "node-a", 10)
+                .expect("preserved relation")[0]
+                .relation_status,
+            NodeAgentRelationStatus::Active
+        );
+        assert_eq!(
+            store
+                .list_nodes(Some("network-1"), Some(RegistrationNodeStatus::Stale), 10,)
+                .expect("stale nodes")
+                .len(),
+            1
+        );
+
+        let mut restored_record = discovery_record(&agent.agent_did, 2);
+        let restored_at_ms = now_ms();
+        restored_record.body.updated_at_ms = restored_at_ms;
+        store
+            .upsert_discovery_node(&restored_record, restored_at_ms)
+            .expect("restore node-agent relation");
+
+        assert_eq!(
+            store
+                .get_agent(&agent.network_id, &agent.agent_did)
+                .expect("restored agent lookup")
+                .expect("restored agent")
+                .status,
+            RegistrationAgentStatus::Active
+        );
+        assert_eq!(
+            store
+                .list_node_agents("network-1", "node-a", 10)
+                .expect("restored relation")[0]
+                .relation_status,
+            NodeAgentRelationStatus::Active
+        );
+        assert_eq!(
+            store
+                .list_nodes(Some("network-1"), Some(RegistrationNodeStatus::Active), 10,)
+                .expect("reactivated nodes")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn discovery_preserves_administrator_node_statuses() {
+        for administrator_status in [
+            RegistrationNodeStatus::Disabled,
+            RegistrationNodeStatus::Revoked,
+        ] {
+            let store = RegistryStore::open_in_memory().expect("store");
+            store
+                .upsert_discovery_node(&discovery_record("did:key:agent", 1), 2_000)
+                .expect("store discovery node");
+
+            {
+                let mut backend = store.backend.lock().expect("store lock");
+                let Backend::Memory(state) = &mut *backend else {
+                    panic!("expected memory backend");
+                };
+                state
+                    .nodes
+                    .get_mut(&("network-1".to_owned(), "node-a".to_owned()))
+                    .expect("stored node")
+                    .status = administrator_status;
+            }
+
+            let mut refreshed_record = discovery_record("did:key:agent", 2);
+            refreshed_record.body.updated_at_ms = 2_100;
+            store
+                .upsert_discovery_node(&refreshed_record, 2_100)
+                .expect("refresh administrator-controlled node");
+
+            {
+                let mut backend = store.backend.lock().expect("store lock");
+                let Backend::Memory(state) = &mut *backend else {
+                    panic!("expected memory backend");
+                };
+                expire_discovery_nodes_memory(state, 10_000);
+            }
+
+            assert_eq!(
+                store
+                    .list_nodes(Some("network-1"), Some(administrator_status), 10)
+                    .expect("administrator-controlled nodes")
+                    .len(),
+                1
+            );
+            assert!(
+                store
+                    .get_node("network-1", "node-a")
+                    .expect("active node lookup")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_without_agent_card_preserves_previous_agent_relation() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        let agent = request("removed-agent", "Removed Agent");
+        store
+            .insert_request(&agent, RegistrationStatus::Pending, "auto", 1_000)
+            .expect("insert agent request");
+        store
+            .transition(
+                &agent.request_id,
+                RegistrationDecisionKind::Approve,
+                &decision(
+                    &agent,
+                    RegistrationDecisionKind::Approve,
+                    RegistrationStatus::Approved,
+                    1_100,
+                ),
+                Some(&credential(&agent, "credential-removed-agent")),
+                1_100,
+            )
+            .expect("approve agent");
+        store
+            .upsert_discovery_node(&discovery_record(&agent.agent_did, 1), 2_000)
+            .expect("store active node-agent relation");
+
+        let mut node_only_record = discovery_record(&agent.agent_did, 2);
+        node_only_record.body.source_agent_card = None;
+        store
+            .upsert_discovery_node(&node_only_record, 2_100)
+            .expect("store node-only discovery record");
+
+        assert_eq!(
+            store
+                .get_agent(&agent.network_id, &agent.agent_did)
+                .expect("agent lookup")
+                .expect("registered agent")
+                .status,
+            RegistrationAgentStatus::Active
+        );
+        assert_eq!(
+            store
+                .list_node_agents("network-1", "node-a", 10)
+                .expect("node-agent relations")[0]
+                .relation_status,
+            NodeAgentRelationStatus::Active
+        );
+        assert_eq!(
+            store
+                .get_credential("credential-removed-agent")
+                .expect("credential lookup")
+                .expect("credential")
+                .status,
+            "active"
+        );
+    }
+
+    #[test]
+    fn changed_agent_did_supersedes_binding_without_changing_authorization() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        let old_agent = request("old-agent", "Old Agent");
+        store
+            .insert_request(&old_agent, RegistrationStatus::Pending, "auto", 1_000)
+            .expect("insert old agent request");
+        store
+            .transition(
+                &old_agent.request_id,
+                RegistrationDecisionKind::Approve,
+                &decision(
+                    &old_agent,
+                    RegistrationDecisionKind::Approve,
+                    RegistrationStatus::Approved,
+                    1_100,
+                ),
+                Some(&credential(&old_agent, "credential-old-agent")),
+                1_100,
+            )
+            .expect("approve old agent");
+        store
+            .upsert_discovery_node(&discovery_record(&old_agent.agent_did, 1), 2_000)
+            .expect("store old node-agent relation");
+
+        let new_agent = request("new-agent", "New Agent");
+        store
+            .upsert_discovery_node(&discovery_record(&new_agent.agent_did, 2), 2_100)
+            .expect("store new pending node-agent relation");
+
+        assert_eq!(
+            store
+                .get_agent(&old_agent.network_id, &old_agent.agent_did)
+                .expect("old agent lookup")
+                .expect("old agent")
+                .status,
+            RegistrationAgentStatus::Active
+        );
+        assert_eq!(
+            store
+                .get_credential("credential-old-agent")
+                .expect("old credential lookup")
+                .expect("old credential")
+                .agent_did,
+            old_agent.agent_did
+        );
+        assert_eq!(
+            store
+                .get_credential("credential-old-agent")
+                .expect("old credential lookup")
+                .expect("old credential")
+                .status,
+            "active"
+        );
+        assert!(
+            store
+                .get_agent(&new_agent.network_id, &new_agent.agent_did)
+                .expect("new agent lookup")
+                .is_none()
+        );
+        let links = store
+            .list_node_agents("network-1", "node-a", 10)
+            .expect("changed DID relations");
+        assert_eq!(
+            links
+                .iter()
+                .find(|link| link.agent_did == old_agent.agent_did)
+                .expect("old relation")
+                .relation_status,
+            NodeAgentRelationStatus::Superseded
+        );
+        assert_eq!(
+            links
+                .iter()
+                .find(|link| link.agent_did == new_agent.agent_did)
+                .expect("new relation")
+                .relation_status,
+            NodeAgentRelationStatus::Pending
         );
     }
 

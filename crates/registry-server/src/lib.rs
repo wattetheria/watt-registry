@@ -375,7 +375,6 @@ async fn initialize_authority(
         "status": result.authority.status,
         "revoked_credentials": result.revoked_credentials,
         "disabled_agents": result.disabled_agents,
-        "disabled_node_agents": result.disabled_node_agents,
     })))
 }
 
