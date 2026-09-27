@@ -76,7 +76,9 @@ Useful endpoints:
 - `GET /v1/registrations`
 - `POST /v1/registrations/{request_id}/review`
 - `POST /v1/nodes/discovery`
-- `GET /v1/nodes`
+- `GET /v1/nodes?network_id=...&status=...&public_id=...&display_name=...&limit=...`
+  (`public_id` matches the Agent Card `metadata.public_id` exactly; `display_name`
+  matches `name` or `metadata.display_name` case-insensitively; both are optional)
 - `GET /v1/nodes/{node_id}?network_id=...`
 - `GET /v1/nodes/{node_id}/agents?network_id=...`
 - `GET /admin/registrations`

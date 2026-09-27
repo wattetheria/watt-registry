@@ -224,6 +224,46 @@ CREATE INDEX IF NOT EXISTS registration_nodes_status_index
     ON registration_nodes(network_id, status, last_seen_at_ms DESC);
 CREATE INDEX IF NOT EXISTS registration_nodes_expiry_index
     ON registration_nodes(network_id, record_expires_at_ms);
+CREATE INDEX IF NOT EXISTS registration_nodes_public_id_lookup_index
+    ON registration_nodes(
+        network_id,
+        status,
+        (btrim(regexp_replace(
+            btrim(COALESCE(
+                discovery_record_json::jsonb
+                    #>> '{body,source_agent_card,card,metadata,public_id}',
+                ''
+            )),
+            '^@+',
+            ''
+        ))),
+        last_seen_at_ms DESC,
+        node_id ASC
+    );
+CREATE INDEX IF NOT EXISTS registration_nodes_display_name_lookup_index
+    ON registration_nodes(
+        network_id,
+        status,
+        (lower(btrim(COALESCE(
+            discovery_record_json::jsonb
+                #>> '{body,source_agent_card,card,name}',
+            ''
+        )))),
+        last_seen_at_ms DESC,
+        node_id ASC
+    );
+CREATE INDEX IF NOT EXISTS registration_nodes_metadata_display_name_lookup_index
+    ON registration_nodes(
+        network_id,
+        status,
+        (lower(btrim(COALESCE(
+            discovery_record_json::jsonb
+                #>> '{body,source_agent_card,card,metadata,display_name}',
+            ''
+        )))),
+        last_seen_at_ms DESC,
+        node_id ASC
+    );
 CREATE TABLE IF NOT EXISTS registration_node_agents (
     network_id TEXT NOT NULL,
     node_id TEXT NOT NULL,
@@ -586,6 +626,61 @@ pub struct RegistrationNodeRecord {
     pub last_seen_at_ms: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+/// Narrows node listings to the Agent advertised in each node's Agent Card.
+/// Clients still apply their own exact match; this only has to keep every
+/// candidate they could accept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeAgentFilter {
+    pub public_id: Option<String>,
+    pub display_name: Option<String>,
+}
+
+impl NodeAgentFilter {
+    pub fn new(public_id: Option<&str>, display_name: Option<&str>) -> Self {
+        Self {
+            public_id: normalize_agent_lookup_value(public_id),
+            display_name: normalize_agent_lookup_value(display_name),
+        }
+    }
+
+    fn matches(&self, source_agent_card: Option<&Value>) -> bool {
+        if self.public_id.is_none() && self.display_name.is_none() {
+            return true;
+        }
+        let Some(card) = source_agent_card.and_then(|card| card.get("card")) else {
+            return false;
+        };
+        let text = |pointer: &str| {
+            card.pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+        };
+        if let Some(public_id) = self.public_id.as_deref() {
+            let record_public_id = normalize_agent_lookup_value(Some(text("/metadata/public_id")));
+            if record_public_id.as_deref() != Some(public_id) {
+                return false;
+            }
+        }
+        if let Some(display_name) = self.display_name.as_deref() {
+            let display_name = display_name.to_lowercase();
+            if text("/name").to_lowercase() != display_name
+                && text("/metadata/display_name").to_lowercase() != display_name
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn normalize_agent_lookup_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(|value| value.trim().trim_start_matches('@').trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -994,6 +1089,16 @@ impl RegistryStore {
         status: Option<RegistrationNodeStatus>,
         limit: usize,
     ) -> Result<Vec<RegistrationNodeRecord>> {
+        self.list_nodes_matching(network_id, status, &NodeAgentFilter::default(), limit)
+    }
+
+    pub fn list_nodes_matching(
+        &self,
+        network_id: Option<&str>,
+        status: Option<RegistrationNodeStatus>,
+        filter: &NodeAgentFilter,
+        limit: usize,
+    ) -> Result<Vec<RegistrationNodeRecord>> {
         let limit = limit.clamp(1, 500);
         let mut backend = self
             .backend
@@ -1003,20 +1108,12 @@ impl RegistryStore {
             Backend::Postgres(client) => {
                 expire_credentials_postgres(client.as_mut(), now_ms())?;
                 expire_discovery_nodes_postgres(client.as_mut(), now_ms())?;
-                list_nodes_postgres(client, network_id, status, limit)
+                list_nodes_postgres(client, network_id, status, filter, limit)
             }
             Backend::Memory(state) => {
                 expire_credentials_memory(state, now_ms());
                 expire_discovery_nodes_memory(state, now_ms());
-                list_nodes_memory(
-                    &state.nodes,
-                    &state.node_agents,
-                    &state.agents,
-                    &state.credentials,
-                    network_id,
-                    status,
-                    limit,
-                )
+                list_nodes_memory(state, network_id, status, filter, limit)
             }
         }
     }
@@ -3050,6 +3147,7 @@ fn list_nodes_postgres(
     client: &mut Client,
     network_id: Option<&str>,
     status: Option<RegistrationNodeStatus>,
+    filter: &NodeAgentFilter,
     limit: usize,
 ) -> Result<Vec<RegistrationNodeRecord>> {
     let network_id = network_id.map(str::to_owned);
@@ -3094,28 +3192,52 @@ fn list_nodes_postgres(
                      )
                )
            )
+           AND (
+               $4::TEXT IS NULL
+               OR btrim(regexp_replace(btrim(COALESCE(discovery_record_json::jsonb
+                   #>> '{body,source_agent_card,card,metadata,public_id}', '')), '^@+', '')) = $4
+           )
+           AND (
+               $5::TEXT IS NULL
+               OR lower(btrim(COALESCE(discovery_record_json::jsonb
+                   #>> '{body,source_agent_card,card,name}', ''))) = lower($5)
+               OR lower(btrim(COALESCE(discovery_record_json::jsonb
+                   #>> '{body,source_agent_card,card,metadata,display_name}', ''))) = lower($5)
+           )
          ORDER BY last_seen_at_ms DESC, node_id ASC
          LIMIT $3",
-        &[&network_id, &status, &(limit as i64)],
+        &[
+            &network_id,
+            &status,
+            &(limit as i64),
+            &filter.public_id,
+            &filter.display_name,
+        ],
     )?;
     rows.iter().map(row_to_node).collect()
 }
 
 fn list_nodes_memory(
-    nodes: &BTreeMap<(String, String), RegistrationNodeRecord>,
-    node_agents: &BTreeMap<(String, String, String), RegistrationNodeAgentRecord>,
-    agents: &BTreeMap<(String, String), RegistrationAgentRecord>,
-    credentials: &BTreeMap<String, RegistrationCredentialRecord>,
+    state: &MemoryState,
     network_id: Option<&str>,
     status: Option<RegistrationNodeStatus>,
+    filter: &NodeAgentFilter,
     limit: usize,
 ) -> Result<Vec<RegistrationNodeRecord>> {
+    let MemoryState {
+        nodes,
+        node_agents,
+        agents,
+        credentials,
+        ..
+    } = state;
     let expected_status = status.unwrap_or(RegistrationNodeStatus::Active);
     let mut nodes = nodes
         .values()
         .filter(|node| {
             if network_id.is_some_and(|network| node.network_id != network)
                 || node.status != expected_status
+                || !filter.matches(node.record.body.source_agent_card.as_ref())
             {
                 return false;
             }
@@ -4106,6 +4228,113 @@ mod tests {
                 .expect("agent")
                 .status,
             RegistrationAgentStatus::Active
+        );
+    }
+
+    fn stale_node_with_agent_card(store: &RegistryStore, node_id: &str, card: Value) {
+        let mut record = discovery_record_for(node_id, &format!("did:key:{node_id}"), 1);
+        record.body.source_agent_card.as_mut().expect("agent card")["card"] = card;
+        store
+            .upsert_discovery_node(&record, 2_000)
+            .expect("store discovery node");
+        let mut backend = store.backend.lock().expect("store lock");
+        let Backend::Memory(state) = &mut *backend else {
+            panic!("expected memory backend");
+        };
+        // Stale listings skip the Agent registration check, isolating the filter.
+        state
+            .nodes
+            .get_mut(&("network-1".to_owned(), node_id.to_owned()))
+            .expect("stored node")
+            .status = RegistrationNodeStatus::Stale;
+    }
+
+    fn matching_node_ids(store: &RegistryStore, filter: &NodeAgentFilter) -> Vec<String> {
+        let mut node_ids = store
+            .list_nodes_matching(
+                Some("network-1"),
+                Some(RegistrationNodeStatus::Stale),
+                filter,
+                10,
+            )
+            .expect("list nodes")
+            .into_iter()
+            .map(|node| node.node_id)
+            .collect::<Vec<_>>();
+        node_ids.sort();
+        node_ids
+    }
+
+    #[test]
+    fn node_listing_filters_by_agent_card_public_id() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        stale_node_with_agent_card(
+            &store,
+            "node-a",
+            json!({"name": "Alpha", "metadata": {"public_id": "agent-alpha"}}),
+        );
+        stale_node_with_agent_card(
+            &store,
+            "node-b",
+            json!({"name": "Beta", "metadata": {"public_id": "@agent-beta"}}),
+        );
+
+        assert_eq!(
+            matching_node_ids(&store, &NodeAgentFilter::new(Some(" @agent-beta "), None)),
+            vec!["node-b"]
+        );
+        assert!(
+            matching_node_ids(&store, &NodeAgentFilter::new(Some("Agent-Beta"), None)).is_empty()
+        );
+        assert!(
+            matching_node_ids(&store, &NodeAgentFilter::new(Some("agent-gamma"), None)).is_empty()
+        );
+    }
+
+    #[test]
+    fn node_listing_filters_by_display_name_case_insensitively() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        stale_node_with_agent_card(
+            &store,
+            "node-a",
+            json!({"name": "Alpha Broker", "metadata": {"public_id": "agent-alpha"}}),
+        );
+        stale_node_with_agent_card(
+            &store,
+            "node-b",
+            json!({"metadata": {"public_id": "agent-beta", "display_name": "Beta Broker"}}),
+        );
+
+        assert_eq!(
+            matching_node_ids(&store, &NodeAgentFilter::new(None, Some("alpha broker"))),
+            vec!["node-a"]
+        );
+        assert_eq!(
+            matching_node_ids(&store, &NodeAgentFilter::new(None, Some("BETA BROKER"))),
+            vec!["node-b"]
+        );
+    }
+
+    #[test]
+    fn node_listing_without_agent_filter_keeps_every_node() {
+        let store = RegistryStore::open_in_memory().expect("store");
+        stale_node_with_agent_card(
+            &store,
+            "node-a",
+            json!({"name": "Alpha", "metadata": {"public_id": "agent-alpha"}}),
+        );
+        stale_node_with_agent_card(&store, "node-b", json!({"name": "Beta"}));
+
+        assert_eq!(
+            matching_node_ids(&store, &NodeAgentFilter::new(Some("  "), Some("@"))),
+            vec!["node-a", "node-b"]
+        );
+        assert_eq!(
+            store
+                .list_nodes(Some("network-1"), Some(RegistrationNodeStatus::Stale), 10)
+                .expect("unfiltered nodes")
+                .len(),
+            2
         );
     }
 

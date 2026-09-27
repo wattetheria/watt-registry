@@ -205,6 +205,8 @@ struct LegacyRegistrationListQuery {
 struct NodeListQuery {
     network_id: Option<String>,
     status: Option<RegistrationNodeStatus>,
+    public_id: Option<String>,
+    display_name: Option<String>,
     limit: Option<usize>,
 }
 
@@ -641,9 +643,15 @@ async fn list_nodes(
     let store = state.store.clone();
     let network_id = query.network_id;
     let status = query.status;
+    let filter = registry_storage::NodeAgentFilter::new(
+        query.public_id.as_deref(),
+        query.display_name.as_deref(),
+    );
     let limit = query.limit.unwrap_or(100);
-    let records =
-        run_blocking(move || Ok(store.list_nodes(network_id.as_deref(), status, limit)?)).await?;
+    let records = run_blocking(move || {
+        Ok(store.list_nodes_matching(network_id.as_deref(), status, &filter, limit)?)
+    })
+    .await?;
     Ok(Json(json!({"ok": true, "records": records})))
 }
 
@@ -1401,6 +1409,56 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn node_listing_applies_agent_filters_from_query() {
+        let state = RegistryState {
+            store: RegistryStore::open_in_memory().expect("store"),
+            authority: AuthoritySigner::from_seed([12; 32]),
+            credential_ttl_seconds: None,
+            registration_mode: RegistrationMode::Manual,
+        };
+        let app = build_router(state);
+        let record = signed_discovery_record();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/nodes/discovery")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&record).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let list = |query: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(format!("/v1/nodes?network_id=network-1{query}"))
+                            .body(Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("body"),
+                )
+                .expect("json");
+                body["records"].as_array().expect("records").len()
+            }
+        };
+
+        assert_eq!(list("").await, 1);
+        // The stored node advertises no Agent Card, so any Agent filter excludes it.
+        assert_eq!(list("&public_id=agent-alpha").await, 0);
+        assert_eq!(list("&display_name=Alpha").await, 0);
     }
 
     #[tokio::test]
