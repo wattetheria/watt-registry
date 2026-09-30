@@ -2615,7 +2615,13 @@ fn update_agent_nickname_postgres(
             if error
                 .as_db_error()
                 .and_then(|database_error| database_error.constraint())
-                == Some("registration_agents_display_name_active_unique") =>
+                .is_some_and(|constraint| {
+                    matches!(
+                        constraint,
+                        "registration_agents_display_name_reserved_unique"
+                            | "registration_agents_display_name_active_unique"
+                    )
+                }) =>
         {
             bail!("agent or nickname already has an active registration")
         }
@@ -3592,6 +3598,7 @@ fn map_insert_error(error: postgres::Error) -> anyhow::Error {
     match constraint.as_str() {
         "registration_agent_active_unique"
         | "registration_nickname_active_unique"
+        | "registration_agents_display_name_reserved_unique"
         | "registration_agents_display_name_active_unique" => {
             anyhow::anyhow!("agent or nickname already has an active registration")
         }
